@@ -831,10 +831,9 @@ def select_best_ensemble_members(
         mae     = np.mean(np.abs(v_input - v_omni[:, :, None]), axis=1)   # (B, N_ens)
         best_indices = np.argsort(mae, axis=1)[:, :n_keep]                # (B, n_keep)
 
-        v_filtered = np.stack([
-            v[b, :, best_indices[b]]  # (T_full, n_keep)
-            for b in range(B)
-        ], axis=0)                                                         # (B, T_full, n_keep)
+        v_filtered = np.stack([v[b][:, best_indices[b]] for b in range(B)], axis=0) # (B, T_full, n_keep)
+        assert v_filtered.shape == (B, T_full, n_keep), \
+            f"expected (B, T_full, n_keep), got {v_filtered.shape}"
 
         return v_filtered
 
