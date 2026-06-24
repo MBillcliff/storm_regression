@@ -1,0 +1,46 @@
+# Data — large, lives outside the repo (referenced by path)
+*.parquet
+*.npy
+
+# Experiment outputs — regenerable from code + config + data
+results/
+metrics/
+*.pkl
+
+# Figures — scratch plots ignored; track paper figures elsewhere if needed
+figures/
+*.png
+
+# Build / packaging
+*.egg-info/
+build/
+dist/
+
+# Shared data folder (keep the dir, not its contents)
+shared_data/*
+!shared_data/.gitkeep
+
+# Byte-compiled
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Local config / secrets
+.env
+old_notebooks/
