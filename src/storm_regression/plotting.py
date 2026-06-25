@@ -188,46 +188,31 @@ def weibull_dual_plot(lam_pred, k_pred, weighted_mean_pred, true,
     plt.show()
 
 
-def plot_case_study(forecasting_dataset, results, window_position, test_idx, 
+def plot_case_study(forecasting_dataset, results, window_position, test_idx,
                    config=None, thresholds=None, save=False, save_name=None, huxt_id=None):
     """
     Plot a single forecasting window with forecast probability gradient.
-    
-    Layout: Bz_GSM (top), Solar Wind Velocity, Hp30 with probability contours (left),
-    and Ensemble Distribution histogram (right side, vertical).
 
-    Parameters
-    ----------
-    forecasting_dataset : ForecastingDataset
-        Dataset object.
-    results : dict
-        Dictionary containing forecasted distribution parameters.
-    window_position : int
-        Position in valid_indices (0 to len(dataset)-1).
-    test_idx : int
-        Index to access the forecasted parameters in results dict.
-    config : dict, optional
-        Config dict. If provided and has 'mlp_ensemble_percentiles', highlights
-        those percentile ensemble members in the velocity panel.
-    thresholds : np.ndarray, optional
-        Thresholds for probability of exceedance.
-    save : bool
-        Whether to save the figure
-    save_name : str, optional
-        Filename for saving
-    huxt_id : int, optional
-        HUXt run ID for filename
+    Supports BOTH the single-LogNormal head (results have log_mu/log_sigma) and the
+    mixture head (results have mu_m/sigma_m/alpha). For a mixture, the predictive
+    distribution, the exceedance probabilities, and the probability contours are all
+    computed from the full weighted mixture sum_k w_k LogNormal(mu_k, sigma_k); the
+    histogram panel also overlays the individual weighted components (dashed) so the
+    bimodality / component usage is visible per window.
+
+    Layout: Bz_GSM (top), Solar Wind Velocity, Hp30 with probability contours (left),
+    and predictive distribution (right side, vertical).
     """
     fontsize = 16
     ylim = 13
     ylen = ylim * 3 + 1
     if thresholds is None:
         thresholds = np.linspace(1/6, ylim + 1/6, ylen)
-    
+
     # Get window data
     print(f"Window position: {window_position}")
     window = forecasting_dataset[window_position]
-    
+
     # Extract data
     v = window['v']                          # (T, Nens)
     omni = window['omni_sw_plotting']
@@ -236,7 +221,7 @@ def plot_case_study(forecasting_dataset, results, window_position, test_idx,
     max_target = float(window['max_target'])
     center_idx = window['center_idx']
     window_label = window['window_label']
-    
+
     # Timestamps
     T0 = forecasting_dataset.df.index[center_idx]
     F_start = forecasting_dataset.df.index[center_idx + forecasting_dataset.lead_time]
@@ -249,28 +234,78 @@ def plot_case_study(forecasting_dataset, results, window_position, test_idx,
     )
     print(f'T0: {T0}')
 
-    # Determine model type
+    # Determine model type (ensemble vs direct/mlp)
     model_type = results.get('model_type', 'ensemble' if 'ensemble_predictions' in results else 'direct')
 
-    # LogNormal parameters - same keys for both model types
-    log_mu_pred = results['log_mu'][test_idx]
-    log_sigma_pred = results['log_sigma'][test_idx]
-    p_exceeds = lognormal_exceeds(log_mu_pred, log_sigma_pred, [max_target])
-    lognormal_median = np.exp(log_mu_pred)
+    # ── Predictive distribution: mixture-aware ────────────────────────────────
+    # Detect a mixture forecast by its keys; otherwise fall back to single LogNormal.
+    is_mixture = ('mu_m' in results and 'sigma_m' in results and 'alpha' in results)
 
-    # Compute probability contours
-    probs = lognormal_exceeds(log_mu_pred, log_sigma_pred, thresholds[:, None])
-    probs = np.tile(probs, (1, forecasting_dataset.forecast_steps))
+    # --- diagnostic ---
+    print(f"[case study] result keys: {sorted(results.keys())}")
+    print(f"[case study] is_mixture = {is_mixture}")
+    if is_mixture:
+        print(f"[case study] K = {np.atleast_1d(results['mu_m'][test_idx]).shape[0]}")
+        print(f"[case study]   mu_m    = {np.atleast_1d(results['mu_m'][test_idx])}")
+        print(f"[case study]   sigma_m = {np.atleast_1d(results['sigma_m'][test_idx])}")
+        print(f"[case study]   alpha   = {np.atleast_1d(results['alpha'][test_idx])}")
+    else:
+        print("[case study] -> falling back to single LogNormal (no mu_m/sigma_m/alpha keys)")
+    # --- end diagnostic ---
+
+    if is_mixture:
+        mu_k    = np.atleast_1d(results['mu_m'][test_idx]).astype(float)     # (K,)
+        sigma_k = np.atleast_1d(results['sigma_m'][test_idx]).astype(float)  # (K,)
+        w_k     = np.atleast_1d(results['alpha'][test_idx]).astype(float)    # (K,)
+        K = len(mu_k)
+
+        def mix_exceeds(thresh):
+            """P(Y >= thresh) under the mixture. thresh scalar or 1-D -> matches shape."""
+            thresh = np.atleast_1d(np.asarray(thresh, dtype=float))
+            out = np.zeros_like(thresh, dtype=float)
+            for k in range(K):
+                out += w_k[k] * (1.0 - lognorm.cdf(thresh, s=sigma_k[k], scale=np.exp(mu_k[k])))
+            return out
+
+        def mix_pdf(y):
+            y = np.asarray(y, dtype=float)
+            return sum(w_k[k] * lognorm.pdf(y, s=sigma_k[k], scale=np.exp(mu_k[k]))
+                       for k in range(K))
+
+        # mixture median via numerical CDF inversion on a fine grid
+        _grid = np.linspace(1e-3, ylim + 2, 4000)
+        _cdf = sum(w_k[k] * lognorm.cdf(_grid, s=sigma_k[k], scale=np.exp(mu_k[k]))
+                   for k in range(K))
+        mixture_median = float(np.interp(0.5, _cdf, _grid))
+        dist_label = "Mixture"
+    else:
+        log_mu_pred    = float(results['log_mu'][test_idx])
+        log_sigma_pred = float(results['log_sigma'][test_idx])
+
+        def mix_exceeds(thresh):
+            thresh = np.atleast_1d(np.asarray(thresh, dtype=float))
+            return np.asarray(lognormal_exceeds(log_mu_pred, log_sigma_pred, thresh)).ravel()
+
+        def mix_pdf(y):
+            return lognorm.pdf(y, s=log_sigma_pred, scale=np.exp(log_mu_pred))
+
+        mixture_median = float(np.exp(log_mu_pred))
+        dist_label = "LogNormal"
+
+    # Exceedance at the observed maximum (the traffic-light number)
+    p_exceeds = mix_exceeds([max_target])
+
+    # Probability contours over the forecast window
+    probs = mix_exceeds(thresholds)                                  # (n_thresh,)
+    probs = np.tile(probs[:, None], (1, forecasting_dataset.forecast_steps))
 
     # ── Filter ensemble members if required ──────────────────────────────────
     if config is not None and config.get('filter_ensemble', False):
         n_keep   = config.get('n_ensemble_keep', 50)
-        # Use only input portion of v for MAE calculation
-        # omni is (T_input,) — already input window only
-        v_input  = v[:omni.shape[0], :]          # (T_input, N_ens)
-        mae      = np.mean(np.abs(v_input - omni[:, None]), axis=0)  # (N_ens,)
-        best_idx = np.argsort(mae)[:n_keep]       # (n_keep,)
-        v        = v[:, best_idx]                 # (T_full, n_keep) — filter full v
+        v_input  = v[:omni.shape[0], :]
+        mae      = np.mean(np.abs(v_input - omni[:, None]), axis=0)
+        best_idx = np.argsort(mae)[:n_keep]
+        v        = v[:, best_idx]
         print(f"Filtered ensemble: kept {n_keep} of {mae.shape[0]} members")
 
     # ── Percentile ensemble members ───────────────────────────────────────────
@@ -282,19 +317,15 @@ def plot_case_study(forecasting_dataset, results, window_position, test_idx,
         print('selection method', selection_method)
 
         if selection_method == 'snap':
-            member_mean_v = v.mean(axis=0)           # (N_ens,)
-            rank_order    = np.argsort(member_mean_v) # low -> high
+            member_mean_v = v.mean(axis=0)
+            rank_order    = np.argsort(member_mean_v)
             for p in percentiles:
                 rank_idx = min(int(np.floor(p / 100 * n_members)), n_members - 1)
                 percentile_member_indices[p] = int(rank_order[rank_idx])
-
         elif selection_method == 'per_timestep':
-            # Per-timestep percentile — find the member whose mean is nearest
-            # to the percentile value across time as a best approximation
             for p in percentiles:
-                v_p      = np.percentile(v, p, axis=1, method='nearest')  # (T,)
-                # Find most frequently nearest member across timesteps
-                member_indices = np.argmin(np.abs(v - v_p[:, None]), axis=1)  # (T,)
+                v_p      = np.percentile(v, p, axis=1, method='nearest')
+                member_indices = np.argmin(np.abs(v - v_p[:, None]), axis=1)
                 percentile_member_indices[p] = int(np.bincount(member_indices).argmax())
 
     # ── Pair outer percentiles symmetrically ─────────────────────────────────
@@ -309,35 +340,30 @@ def plot_case_study(forecasting_dataset, results, window_position, test_idx,
     # GET ICME AND SIR FLAGS AND FIND PERIODS
     icme_periods = []
     sir_periods = []
-    
     if 'ICME_flag' in forecasting_dataset.df.columns:
         window_start_idx = center_idx + forecasting_dataset.min_offset
         window_end_idx = center_idx + forecasting_dataset.max_offset + 1
         window_df = forecasting_dataset.df.iloc[window_start_idx:window_end_idx]
         icme_flags = window_df['ICME_flag'].values
         sir_flags = window_df['SIR_flag'].values
-        
+
         in_icme = False
         icme_start = None
         for i in range(len(icme_flags)):
             if icme_flags[i] and not in_icme:
-                icme_start = timestamps[i]
-                in_icme = True
+                icme_start = timestamps[i]; in_icme = True
             elif not icme_flags[i] and in_icme:
-                icme_periods.append((icme_start, timestamps[i - 1]))
-                in_icme = False
+                icme_periods.append((icme_start, timestamps[i - 1])); in_icme = False
         if in_icme:
             icme_periods.append((icme_start, timestamps[-1]))
-        
+
         in_sir = False
         sir_start = None
         for i in range(len(sir_flags)):
             if sir_flags[i] and not in_sir:
-                sir_start = timestamps[i]
-                in_sir = True
+                sir_start = timestamps[i]; in_sir = True
             elif not sir_flags[i] and in_sir:
-                sir_periods.append((sir_start, timestamps[i - 1]))
-                in_sir = False
+                sir_periods.append((sir_start, timestamps[i - 1])); in_sir = False
         if in_sir:
             sir_periods.append((sir_start, timestamps[-1]))
 
@@ -347,7 +373,7 @@ def plot_case_study(forecasting_dataset, results, window_position, test_idx,
     fig = plt.figure(figsize=(16, 10))
     gs = GridSpec(3, 2, figure=fig, height_ratios=[1.5, 2, 2.5],
                   width_ratios=[3, 1], hspace=0.05, wspace=0.05)
-    
+
     ax_bz   = fig.add_subplot(gs[0, 0])
     ax_v    = fig.add_subplot(gs[1, 0], sharex=ax_bz)
     ax_hp30 = fig.add_subplot(gs[2, 0], sharex=ax_bz)
@@ -405,15 +431,12 @@ def plot_case_study(forecasting_dataset, results, window_position, test_idx,
 
     # ===== PANEL 2: Solar Wind Velocity =====
     highlighted_members = set(percentile_member_indices.values())
-
-    # Background members
     for i in range(v.shape[1]):
         if i in highlighted_members:
             continue
         ax_v.plot(timestamps, v[:, i], color='blue', lw=1, alpha=0.1,
                   label='v ensemble' if i == 0 else None)
 
-    # Shaded bands between paired percentiles
     band_colours = ['steelblue', 'royalblue']
     band_alphas  = [0.2, 0.4]
     for j, (lo_p, hi_p) in enumerate(percentile_bands):
@@ -422,11 +445,10 @@ def plot_case_study(forecasting_dataset, results, window_position, test_idx,
         colour = band_colours[j % len(band_colours)]
         alpha  = band_alphas[j % len(band_alphas)]
         ax_v.fill_between(timestamps, lo_v, hi_v,
-                          alpha=alpha, color=colour, label=f'p{lo_p}–p{hi_p}')
+                          alpha=alpha, color=colour, label=f'p{lo_p}-p{hi_p}')
         ax_v.plot(timestamps, lo_v, color=colour, lw=2.0, alpha=0.9, linestyle='--')
         ax_v.plot(timestamps, hi_v, color=colour, lw=2.0, alpha=0.9, linestyle='--')
-        
-    # Median member
+
     if median_p is not None:
         ax_v.plot(timestamps, v[:, percentile_member_indices[median_p]],
                   color='blue', lw=2, linestyle='-', alpha=0.9,
@@ -468,7 +490,7 @@ def plot_case_study(forecasting_dataset, results, window_position, test_idx,
     ax_hp30.plot([xF[0], xF[-1]], [max_target, max_target],
                  color=max_hp30_colour, linestyle='--', label='Max Hp30')
     ax_hp30.text(xF[0] - timedelta(minutes=10 * 60), max_target - 0.5,
-                 f'p(X≥{max_target:.2f})={p_exceeds[0]:.2f}',
+                 f'p(X>={max_target:.2f})={p_exceeds[0]:.2f}',
                  verticalalignment='bottom', color=max_hp30_colour)
     ax_hp30.axvline(T0, color='black', linestyle='--', label='T0')
     ax_hp30.axvspan(xF[0] - timedelta(minutes=15), xF[-1] + timedelta(minutes=15),
@@ -481,43 +503,45 @@ def plot_case_study(forecasting_dataset, results, window_position, test_idx,
     ax_hp30.set_xlim(timestamps[0], timestamps[-1])
     ax_hp30.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d %H:%M'))
 
-    # ===== PANEL 4: Vertical Histogram =====
+    # ===== PANEL 4: Vertical predictive distribution =====
     y_range = np.linspace(0.01, ylim + 1, 300)
-    lognormal_pdf = lognorm.pdf(y_range, s=log_sigma_pred, scale=np.exp(log_mu_pred))
+    pred_pdf = mix_pdf(y_range)
 
     if model_type == 'ensemble':
         if 'ensemble_predictions' not in results:
-            raise ValueError("model_type is 'ensemble' but 'ensemble_predictions' not found in results")
+            raise ValueError("model_type is 'ensemble' but 'ensemble_predictions' not found")
         ensemble_preds = results['ensemble_predictions'][test_idx]
         ax_hist.hist(ensemble_preds, bins=30, alpha=0.7, color='steelblue',
                      edgecolor='black', density=True, orientation='horizontal',
                      label='Ensemble predictions')
-        ax_hist.plot(lognormal_pdf, y_range, color='orange', linestyle='--', lw=2,
-                     label=f'LogNormal fit\n(μ={log_mu_pred:.2f}, σ={log_sigma_pred:.2f})')
+        ax_hist.plot(pred_pdf, y_range, color='orange', linestyle='--', lw=2,
+                     label=f'{dist_label} fit')
     else:  # direct / MLP
-        ax_hist.plot(lognormal_pdf, y_range, color='orange', lw=2,
-                     label=f'LogNormal\n(μ={log_mu_pred:.2f}, σ={log_sigma_pred:.2f})')
-        ax_hist.fill_betweenx(y_range, lognormal_pdf, alpha=0.2, color='orange')
+        ax_hist.plot(pred_pdf, y_range, color='orange', lw=2, label=f'{dist_label} pdf')
+        ax_hist.fill_betweenx(y_range, pred_pdf, alpha=0.2, color='orange')
+
+    # Overlay individual weighted components for a mixture (the bimodality view)
+    if is_mixture:
+        comp_colours = ['purple', 'green', 'brown', 'teal', 'magenta']
+        for k in range(K):
+            comp_pdf = w_k[k] * lognorm.pdf(y_range, s=sigma_k[k], scale=np.exp(mu_k[k]))
+            ax_hist.plot(comp_pdf, y_range,
+                         color=comp_colours[k % len(comp_colours)],
+                         lw=1.2, ls='--', alpha=0.85,
+                         label=f'comp {k}: w={w_k[k]:.2f}, μ={mu_k[k]:.2f}, σ={sigma_k[k]:.2f}')
 
     ax_hist.axhline(max_target, color=max_hp30_colour, linestyle='--', lw=2, label='True value')
-    ax_hist.axhline(lognormal_median, color='red', linestyle='-.', lw=1.5,
-                    label=f'Median: {lognormal_median:.2f}')
+    ax_hist.axhline(mixture_median, color='red', linestyle='-.', lw=1.5,
+                    label=f'Median: {mixture_median:.2f}')
     ax_hist.yaxis.tick_right()
     ax_hist.yaxis.set_label_position("right")
     ax_hist.set_ylabel('Predicted Hp30', fontsize=fontsize)
     ax_hist.set_xlabel('Density', fontsize=fontsize - 2)
-    ax_hist.legend(
-        loc='upper left',
-        fontsize=8,
-        bbox_to_anchor=(1.02, 1),
-        borderaxespad=0,
-    )
+    ax_hist.legend(loc='upper left', fontsize=8, bbox_to_anchor=(1.02, 1), borderaxespad=0)
     ax_hist.set_ylim(0, ylim)
 
-    # Hide x-labels on top panels
     ax_bz.tick_params(labelbottom=False)
     ax_v.tick_params(labelbottom=False)
-
     fig.autofmt_xdate()
 
     if save and save_name:
@@ -1538,7 +1562,68 @@ def plot_comparative_case_study(
     save_name: Optional[str] = None,
     huxt_id: Optional[int] = None,
     title_suffix: Optional[str] = None,
+    show_components: bool = False,
 ):
+    """
+    Compare multiple models on one forecast window.
+
+    Each model's predictive distribution is detected per-model: if the result has
+    mu_m/sigma_m/alpha it is treated as a K-component LogNormal mixture; otherwise as a
+    single LogNormal (log_mu/log_sigma). The right-hand panel overlays each model's
+    *combined* predictive pdf. Set show_components=True to also dash in each mixture's
+    individual weighted components (useful when inspecting one model's bimodality, noisy
+    when several models are shown).
+    """
+
+    # ── Per-model predictive helpers (mixture-aware) ─────────────────────────
+    def _model_dist(results, test_idx):
+        """Return a dict of callables/values describing this model's forecast."""
+        if all(k in results for k in ('mu_m', 'sigma_m', 'alpha')):
+            mu_k    = np.atleast_1d(results['mu_m'][test_idx]).astype(float)
+            sigma_k = np.atleast_1d(results['sigma_m'][test_idx]).astype(float)
+            w_k     = np.atleast_1d(results['alpha'][test_idx]).astype(float)
+            K = len(mu_k)
+
+            def pdf(y):
+                y = np.asarray(y, dtype=float)
+                return sum(w_k[k] * lognorm.pdf(y, s=sigma_k[k], scale=np.exp(mu_k[k]))
+                           for k in range(K))
+
+            def exceeds(thresh):
+                thresh = np.atleast_1d(np.asarray(thresh, dtype=float))
+                out = np.zeros_like(thresh, dtype=float)
+                for k in range(K):
+                    out += w_k[k] * (1.0 - lognorm.cdf(thresh, s=sigma_k[k],
+                                                       scale=np.exp(mu_k[k])))
+                return out
+
+            _grid = np.linspace(1e-3, 30, 4000)
+            _cdf = sum(w_k[k] * lognorm.cdf(_grid, s=sigma_k[k], scale=np.exp(mu_k[k]))
+                       for k in range(K))
+            median = float(np.interp(0.5, _cdf, _grid))
+
+            return {
+                'is_mixture': True, 'K': K, 'mu_k': mu_k, 'sigma_k': sigma_k, 'w_k': w_k,
+                'pdf': pdf, 'exceeds': exceeds, 'median': median,
+                'label_params': f'K={K}, med={median:.2f}',
+            }
+        else:
+            log_mu    = float(results['log_mu'][test_idx])
+            log_sigma = float(results['log_sigma'][test_idx])
+            median    = float(np.exp(log_mu))
+
+            def pdf(y):
+                return lognorm.pdf(y, s=log_sigma, scale=np.exp(log_mu))
+
+            def exceeds(thresh):
+                thresh = np.atleast_1d(np.asarray(thresh, dtype=float))
+                return np.asarray(lognormal_exceeds(log_mu, log_sigma, thresh)).ravel()
+
+            return {
+                'is_mixture': False, 'pdf': pdf, 'exceeds': exceeds, 'median': median,
+                'label_params': f'μ={log_mu:.2f}, σ={log_sigma:.2f}, med={median:.2f}',
+            }
+
     # ── Distinctive label computation ────────────────────────────────────────
     def get_distinctive_labels(names):
         if len(names) <= 1:
@@ -1555,6 +1640,9 @@ def plot_comparative_case_study(
 
     model_names = list(all_results.keys())
     label_map   = get_distinctive_labels(model_names)
+
+    # Build per-model distribution descriptors once.
+    model_dist = {m: _model_dist(all_results[m], test_idx_map[m]) for m in model_names}
 
     fontsize = 16
     ylim     = 13
@@ -1580,8 +1668,7 @@ def plot_comparative_case_study(
     n_steps    = forecasting_dataset.max_offset - forecasting_dataset.min_offset
     timestamps = pd.date_range(
         start=T0 + timedelta(minutes=30 * forecasting_dataset.min_offset),
-        periods=n_steps,
-        freq='30min',
+        periods=n_steps, freq='30min',
     )
     print(f'T0: {T0}')
 
@@ -1589,24 +1676,20 @@ def plot_comparative_case_study(
     best_model = None
     best_error = np.inf
     for model_name in model_names:
-        test_idx = test_idx_map[model_name]
-        log_mu   = all_results[model_name]['log_mu'][test_idx]
-        median   = np.exp(log_mu)
-        error    = abs(median - max_target)
+        median = model_dist[model_name]['median']
+        error  = abs(median - max_target)
         if error < best_error:
             best_error = error
             best_model = model_name
 
-    best_test_idx    = test_idx_map[best_model]
-    log_mu_anchor    = all_results[best_model]['log_mu'][best_test_idx]
-    log_sigma_anchor = all_results[best_model]['log_sigma'][best_test_idx]
-    probs            = lognormal_exceeds(log_mu_anchor, log_sigma_anchor, thresholds[:, None])
-    probs            = np.tile(probs, (1, forecasting_dataset.forecast_steps))
-    p_exceeds_anchor = lognormal_exceeds(log_mu_anchor, log_sigma_anchor, [max_target])
+    anchor = model_dist[best_model]
+    probs            = anchor['exceeds'](thresholds)                       # (n_thresh,)
+    probs            = np.tile(probs[:, None], (1, forecasting_dataset.forecast_steps))
+    p_exceeds_anchor = anchor['exceeds']([max_target])
     best_label       = label_map[best_model]
 
     print(f"Anchor model for contours: {best_label} "
-          f"(median={np.exp(log_mu_anchor):.2f}, error={best_error:.2f})")
+          f"(median={anchor['median']:.2f}, error={best_error:.2f})")
 
     # ── Filter and select ensemble members using best model's config ──────────
     best_config      = all_configs[best_model]
@@ -1621,7 +1704,6 @@ def plot_comparative_case_study(
         v_display = v_display[:, best_idx]
         print(f"Filtered ensemble to {n_keep} members using best model's config")
 
-    # ── Identify kept vs discarded members ───────────────────────────────────
     if best_config.get('filter_ensemble', False):
         n_keep    = best_config.get('n_ensemble_keep', 50)
         v_input   = v[:omni_sw.shape[0], :]
@@ -1629,7 +1711,6 @@ def plot_comparative_case_study(
         kept_idx  = set(np.argsort(mae)[:n_keep].tolist())
     else:
         kept_idx  = set(range(v.shape[1]))
-
     discarded_idx = set(range(v.shape[1])) - kept_idx
 
     # ── Percentile computation from v_display ─────────────────────────────────
@@ -1640,14 +1721,12 @@ def plot_comparative_case_study(
     if 'mlp_ensemble_percentiles' in best_config:
         percentiles = sorted(best_config['mlp_ensemble_percentiles'])
         n_members   = v_display.shape[1]
-
         if selection_method == 'snap':
             member_mean_v = v_display.mean(axis=0)
             rank_order    = np.argsort(member_mean_v)
             for p in percentiles:
                 rank_idx = min(int(np.floor(p / 100 * n_members)), n_members - 1)
                 percentile_member_indices[p] = int(rank_order[rank_idx])
-
         ps       = percentiles
         median_p = ps[len(ps) // 2]
         for i in range(len(ps) // 2):
@@ -1656,14 +1735,12 @@ def plot_comparative_case_study(
     # ── ICME / SIR periods ───────────────────────────────────────────────────
     icme_periods = []
     sir_periods  = []
-
     if 'ICME_flag' in forecasting_dataset.df.columns:
         window_start_idx = center_idx + forecasting_dataset.min_offset
         window_end_idx   = center_idx + forecasting_dataset.max_offset + 1
         window_df        = forecasting_dataset.df.iloc[window_start_idx:window_end_idx]
         icme_flags       = window_df['ICME_flag'].values
         sir_flags        = window_df['SIR_flag'].values
-
         in_icme = False
         for i in range(len(icme_flags)):
             if icme_flags[i] and not in_icme:
@@ -1672,7 +1749,6 @@ def plot_comparative_case_study(
                 icme_periods.append((icme_start, timestamps[i - 1])); in_icme = False
         if in_icme:
             icme_periods.append((icme_start, timestamps[-1]))
-
         in_sir = False
         for i in range(len(sir_flags)):
             if sir_flags[i] and not in_sir:
@@ -1689,33 +1765,25 @@ def plot_comparative_case_study(
     fig = plt.figure(figsize=(18, 10))
     gs  = GridSpec(3, 2, figure=fig, height_ratios=[1.5, 2, 2.5],
                    width_ratios=[3, 1], hspace=0.05, wspace=0.05)
-
     ax_bz   = fig.add_subplot(gs[0, 0])
     ax_v    = fig.add_subplot(gs[1, 0], sharex=ax_bz)
     ax_hp30 = fig.add_subplot(gs[2, 0], sharex=ax_bz)
     ax_hist = fig.add_subplot(gs[:, 1])
 
-    xF = pd.date_range(
-        start=F_start + pd.Timedelta(minutes=15),
-        periods=forecasting_dataset.forecast_steps, freq='30min'
-    )
-    xG1 = pd.date_range(
-        start=T0 + timedelta(minutes=30 * forecasting_dataset.min_offset),
-        periods=forecasting_dataset.lead_time - forecasting_dataset.min_offset + 1,
-        freq='30min',
-    )
-    xG = pd.date_range(
-        start=T0 + timedelta(minutes=30 * forecasting_dataset.min_offset),
-        periods=forecasting_dataset.max_offset - forecasting_dataset.min_offset + 1,
-        freq='30min',
-    )
+    xF = pd.date_range(start=F_start + pd.Timedelta(minutes=15),
+                       periods=forecasting_dataset.forecast_steps, freq='30min')
+    xG1 = pd.date_range(start=T0 + timedelta(minutes=30 * forecasting_dataset.min_offset),
+                        periods=forecasting_dataset.lead_time - forecasting_dataset.min_offset + 1,
+                        freq='30min')
+    xG = pd.date_range(start=T0 + timedelta(minutes=30 * forecasting_dataset.min_offset),
+                       periods=forecasting_dataset.max_offset - forecasting_dataset.min_offset + 1,
+                       freq='30min')
 
     def add_event_bars(ax, y_position):
         for i, (start, end) in enumerate(icme_periods):
             cap = (ax.get_ylim()[1] - ax.get_ylim()[0]) * 0.02
-            ax.plot([start, end], [y_position, y_position],
-                    color='darkred', lw=3, solid_capstyle='butt',
-                    label='ICME' if i == 0 else '', alpha=0.8)
+            ax.plot([start, end], [y_position, y_position], color='darkred', lw=3,
+                    solid_capstyle='butt', label='ICME' if i == 0 else '', alpha=0.8)
             for x in (start, end):
                 ax.plot([x, x], [y_position - cap, y_position + cap],
                         color='darkred', lw=3, solid_capstyle='butt', alpha=0.8)
@@ -1727,8 +1795,7 @@ def plot_comparative_case_study(
                         color='darkblue', lw=3, solid_capstyle='butt',
                         label='SIR' if i == 0 else '', alpha=0.8)
                 for x in (start, end):
-                    ax.plot([x, x],
-                            [y_position - y_off - cap, y_position - y_off + cap],
+                    ax.plot([x, x], [y_position - y_off - cap, y_position - y_off + cap],
                             color='darkblue', lw=3, solid_capstyle='butt', alpha=0.8)
 
     # ===== PANEL 1: Bz_GSM =====
@@ -1749,99 +1816,70 @@ def plot_comparative_case_study(
     ax_bz.set_title(title, fontsize=fontsize + 2)
 
     # ===== PANEL 2: Solar Wind Velocity =====
-
-    # Discarded members (orange, faded)
     for i in sorted(discarded_idx):
         ax_v.plot(timestamps, v[:, i], color='darkorange', lw=0.8, alpha=0.3,
                   label='Discarded' if i == min(discarded_idx, default=-1) else None)
-
-    # Kept members (blue, faded)
     for i in sorted(kept_idx):
         ax_v.plot(timestamps, v[:, i], color='steelblue', lw=0.8, alpha=0.4,
                   label='Kept' if i == min(kept_idx, default=-1) else None)
 
-    band_colours = ['steelblue', 'royalblue']
-    band_alphas  = [0.2, 0.4]
-
     if selection_method == 'snap':
-        # Single outer shaded region
         if percentile_bands:
             lo_p_outer, hi_p_outer = percentile_bands[0]
             lo_v_outer = v_display[:, percentile_member_indices[lo_p_outer]]
             hi_v_outer = v_display[:, percentile_member_indices[hi_p_outer]]
-            ax_v.fill_between(timestamps, lo_v_outer, hi_v_outer,
-                              alpha=0.15, color='steelblue',
-                              label=f'p{lo_p_outer}–p{hi_p_outer} range')
-
-        # All percentile boundary lines
+            ax_v.fill_between(timestamps, lo_v_outer, hi_v_outer, alpha=0.15,
+                              color='steelblue', label=f'p{lo_p_outer}-p{hi_p_outer} range')
         for j, (lo_p, hi_p) in enumerate(percentile_bands):
-            lo_v      = v_display[:, percentile_member_indices[lo_p]]
-            hi_v      = v_display[:, percentile_member_indices[hi_p]]
-            lw        = 2.0 if j == 0 else 1.5
-            linestyle = '-' if j == 0 else '--'
-            ax_v.plot(timestamps, lo_v, color='steelblue', lw=lw,
-                      alpha=0.9, linestyle=linestyle, label=f'p{lo_p}')
-            ax_v.plot(timestamps, hi_v, color='steelblue', lw=lw,
-                      alpha=0.9, linestyle=linestyle, label=f'p{hi_p}')
-
+            lo_v = v_display[:, percentile_member_indices[lo_p]]
+            hi_v = v_display[:, percentile_member_indices[hi_p]]
+            lw = 2.0 if j == 0 else 1.5
+            ls = '-' if j == 0 else '--'
+            ax_v.plot(timestamps, lo_v, color='steelblue', lw=lw, alpha=0.9, linestyle=ls, label=f'p{lo_p}')
+            ax_v.plot(timestamps, hi_v, color='steelblue', lw=lw, alpha=0.9, linestyle=ls, label=f'p{hi_p}')
         if median_p is not None:
             ax_v.plot(timestamps, v_display[:, percentile_member_indices[median_p]],
-                      color='black', lw=2.5, linestyle='-',
-                      alpha=1.0, zorder=5, label=f'p{median_p} (median)')
-
+                      color='black', lw=2.5, linestyle='-', alpha=1.0, zorder=5, label=f'p{median_p} (median)')
     elif selection_method == 'per_timestep':
         if percentile_bands:
             lo_p_outer, hi_p_outer = percentile_bands[0]
             lo_v_outer = np.percentile(v_display, lo_p_outer, axis=1, method='nearest')
             hi_v_outer = np.percentile(v_display, hi_p_outer, axis=1, method='nearest')
-            ax_v.fill_between(timestamps, lo_v_outer, hi_v_outer,
-                              alpha=0.15, color='steelblue',
-                              label=f'p{lo_p_outer}–p{hi_p_outer} range')
-
+            ax_v.fill_between(timestamps, lo_v_outer, hi_v_outer, alpha=0.15,
+                              color='steelblue', label=f'p{lo_p_outer}-p{hi_p_outer} range')
         for j, (lo_p, hi_p) in enumerate(percentile_bands):
-            lo_v      = np.percentile(v_display, lo_p, axis=1, method='nearest')
-            hi_v      = np.percentile(v_display, hi_p, axis=1, method='nearest')
-            lw        = 2.0 if j == 0 else 1.5
-            linestyle = '-' if j == 0 else '--'
-            ax_v.plot(timestamps, lo_v, color='steelblue', lw=lw,
-                      alpha=0.9, linestyle=linestyle, label=f'p{lo_p}')
-            ax_v.plot(timestamps, hi_v, color='steelblue', lw=lw,
-                      alpha=0.9, linestyle=linestyle, label=f'p{hi_p}')
-
+            lo_v = np.percentile(v_display, lo_p, axis=1, method='nearest')
+            hi_v = np.percentile(v_display, hi_p, axis=1, method='nearest')
+            lw = 2.0 if j == 0 else 1.5
+            ls = '-' if j == 0 else '--'
+            ax_v.plot(timestamps, lo_v, color='steelblue', lw=lw, alpha=0.9, linestyle=ls, label=f'p{lo_p}')
+            ax_v.plot(timestamps, hi_v, color='steelblue', lw=lw, alpha=0.9, linestyle=ls, label=f'p{hi_p}')
         if median_p is not None:
             median_v = np.percentile(v_display, median_p, axis=1, method='nearest')
-            ax_v.plot(timestamps, median_v,
-                      color='black', lw=2.5, linestyle='-',
+            ax_v.plot(timestamps, median_v, color='black', lw=2.5, linestyle='-',
                       alpha=1.0, zorder=5, label=f'p{median_p} (median)')
 
     ax_v.plot(timestamps, omni, 'k--', lw=1.5, label='OMNI V_sw')
     ax_v.axvline(T0, color='black', linestyle='--', label='T0')
-    ax_v.axvspan(xF[0] - timedelta(minutes=15), xF[-1] + timedelta(minutes=15),
-                 color='grey', alpha=0.1)
+    ax_v.axvspan(xF[0] - timedelta(minutes=15), xF[-1] + timedelta(minutes=15), color='grey', alpha=0.1)
     add_event_bars(ax_v, ax_v.get_ylim()[1] * 0.95)
     ax_v.set_ylabel('v (km/s)', fontsize=fontsize)
     ax_v.legend(loc='upper right', fontsize=8)
     ax_v.set_xlim(timestamps[0], timestamps[-1])
 
-    # ===== PANEL 3: Hp30 with probability contours (best model) =====
+    # ===== PANEL 3: Hp30 with probability contours (anchor model) =====
     Edges      = [0, 5, 6, 7, 8, 9, ylim]
     nbands     = len(Edges) - 1
     colors_arr = np.arange(1, nbands + 1)[:, None] + 1
     Z1         = np.tile(colors_arr, (1, len(xG) - 1))
-
     ax_hp30.pcolormesh(xG, Edges, Z1, shading='flat', cmap='Blues', alpha=0.3)
     ax_hp30.contourf(xF, thresholds, probs, levels=20, cmap='Reds', alpha=0.0)
-    contour_lines = ax_hp30.contour(xF, thresholds, probs,
-                                    levels=[0.1, 0.3, 0.5, 0.7, 0.9],
+    contour_lines = ax_hp30.contour(xF, thresholds, probs, levels=[0.1, 0.3, 0.5, 0.7, 0.9],
                                     colors='darkred', linewidths=1)
     ax_hp30.clabel(contour_lines, inline=True, fontsize=8, fmt='%0.1f', rightside_up=True)
-
-    ax_hp30.text(
-        0.01, 0.99, f'Contours: {best_label} ★',
-        transform=ax_hp30.transAxes,
-        fontsize=9, va='top', ha='left', color='darkred',
-        bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.7)
-    )
+    ax_hp30.text(0.01, 0.99, f'Contours: {best_label} *', transform=ax_hp30.transAxes,
+                 fontsize=9, va='top', ha='left', color='darkred',
+                 bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.7))
 
     G_labels = [5, 6, 7, 8, 9, 10]
     g_names  = ['G1', 'G2', 'G3', 'G4', 'G5']
@@ -1849,15 +1887,14 @@ def plot_comparative_case_study(
         y_mid = (G_labels[i] + G_labels[i + 1]) / 2
         ax_hp30.text(xG1[0] + pd.Timedelta(minutes=120), y_mid, g_names[i],
                      va='center', ha='right', fontsize=10, color='black')
-        ax_hp30.hlines(G_labels[i], timestamps[0], timestamps[-1],
-                       color='lightblue', lw=0.5)
+        ax_hp30.hlines(G_labels[i], timestamps[0], timestamps[-1], color='lightblue', lw=0.5)
 
     max_hp30_colour = 'olive'
     ax_hp30.plot(timestamps, target, lw=1, label='Hp30')
-    ax_hp30.plot([xF[0], xF[-1]], [max_target, max_target],
-                 color=max_hp30_colour, linestyle='--', label='Max Hp30')
+    ax_hp30.plot([xF[0], xF[-1]], [max_target, max_target], color=max_hp30_colour,
+                 linestyle='--', label='Max Hp30')
     ax_hp30.text(xF[0] - timedelta(minutes=10 * 60), max_target - 0.5,
-                 f'p(X≥{max_target:.2f})={p_exceeds_anchor[0]:.2f}',
+                 f'p(X>={max_target:.2f})={p_exceeds_anchor[0]:.2f}',
                  verticalalignment='bottom', color=max_hp30_colour)
     ax_hp30.axvline(T0, color='black', linestyle='--', label='T0')
     ax_hp30.axvspan(xF[0] - timedelta(minutes=15), xF[-1] + timedelta(minutes=15),
@@ -1870,53 +1907,44 @@ def plot_comparative_case_study(
     ax_hp30.set_xlim(timestamps[0], timestamps[-1])
     ax_hp30.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d %H:%M'))
 
-    # ===== PANEL 4: Overlaid distributions for all models =====
+    # ===== PANEL 4: Overlaid predictive distributions for all models =====
     y_range      = np.linspace(0.01, ylim + 1, 300)
     colour_cycle = cm.tab10(np.linspace(0, 1, len(model_names)))
 
     for colour, model_name in zip(colour_cycle, model_names):
-        test_idx  = test_idx_map[model_name]
-        results   = all_results[model_name]
-        label     = label_map[model_name]
-
-        log_mu    = results['log_mu'][test_idx]
-        log_sigma = results['log_sigma'][test_idx]
-        median    = np.exp(log_mu)
-        pdf       = lognorm.pdf(y_range, s=log_sigma, scale=np.exp(log_mu))
-
-        is_best = (model_name == best_model)
-        lw      = 3.0 if is_best else 2.0
-        alpha   = 1.0 if is_best else 0.6
-        suffix  = ' ★' if is_best else ''
+        d        = model_dist[model_name]
+        label    = label_map[model_name]
+        pdf      = d['pdf'](y_range)
+        median   = d['median']
+        is_best  = (model_name == best_model)
+        lw       = 3.0 if is_best else 2.0
+        alpha    = 1.0 if is_best else 0.6
+        suffix   = ' *' if is_best else ''
 
         ax_hist.plot(pdf, y_range, lw=lw, color=colour, alpha=alpha,
-                     label=f'{label}{suffix}\n(μ={log_mu:.2f}, σ={log_sigma:.2f}, '
-                           f'med={median:.2f})')
-        ax_hist.fill_betweenx(y_range, pdf,
-                              alpha=0.15 if is_best else 0.08, color=colour)
-        ax_hist.axhline(median, color=colour,
-                        linestyle='-.', lw=1.5 if is_best else 1.2,
-                        alpha=0.9 if is_best else 0.7)
+                     label=f'{label}{suffix}\n({d["label_params"]})')
+        ax_hist.fill_betweenx(y_range, pdf, alpha=0.15 if is_best else 0.08, color=colour)
+        ax_hist.axhline(median, color=colour, linestyle='-.',
+                        lw=1.5 if is_best else 1.2, alpha=0.9 if is_best else 0.7)
+
+        # optional per-component dashed breakdown for mixtures
+        if show_components and d['is_mixture']:
+            for k in range(d['K']):
+                comp = d['w_k'][k] * lognorm.pdf(y_range, s=d['sigma_k'][k],
+                                                 scale=np.exp(d['mu_k'][k]))
+                ax_hist.plot(comp, y_range, color=colour, lw=1.0, ls=':', alpha=0.5)
 
     ax_hist.axhline(max_target, color=max_hp30_colour, linestyle='--', lw=2,
                     label=f'True value: {max_target:.2f}')
-
     ax_hist.yaxis.tick_right()
     ax_hist.yaxis.set_label_position("right")
     ax_hist.set_ylabel('Predicted Hp30', fontsize=fontsize)
     ax_hist.set_xlabel('Density', fontsize=fontsize - 2)
     ax_hist.set_ylim(0, ylim)
-
-    ax_hist.legend(
-        loc='center left',
-        fontsize=7,
-        bbox_to_anchor=(1.15, 0.5),
-        borderaxespad=0,
-    )
+    ax_hist.legend(loc='center left', fontsize=7, bbox_to_anchor=(1.15, 0.5), borderaxespad=0)
 
     ax_bz.tick_params(labelbottom=False)
     ax_v.tick_params(labelbottom=False)
-
     fig.autofmt_xdate()
     fig.subplots_adjust(right=0.72)
 

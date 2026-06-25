@@ -1112,219 +1112,11 @@ def create_probabilistic_dashboard(results_path, family="auto",
               f"{m['sharpness']:>9.3f}{m['coverage'][90]:>8.1f}{m['pit_ks']:>8.3f}")
 
     return fig, prob
-    
 
-def compare_models_and_lead_times(
-    results_dir: Path,
-    models: List[str],
-    lead_times: List[int],
-    seed: int = 42,
-    fold: int = 0,
-    threshold: float = 4.5,
-    test_mode: str = 'balanced',
-    prediction_type: str = 'y_pred_lognormal_median',
-    include_baselines: bool = True,
-    subsets: Optional[Dict] = None,
-    save: bool = False,
-    save_dir: Optional[Path] = None,
-) -> pd.DataFrame:
-    """
-    Compare performance across multiple models and lead times.
-    Recreates dataset per file to respect per-experiment preprocessing.
-    """
-    if subsets is None:
-        subsets = {
-            'All test data': {},
-            'All ICME': {'event_types': ['ICME']},
-            'All SIR': {'event_types': ['SIR']},
-            'Strong storms (>6.5)': {'min_strength': 6.5},
-            'Storms (>4.5)': {'min_strength': 4.5},
-            'No storm (≤4.5)': {'min_strength': 0.0, 'max_strength': 4.5},
-        }
 
-    all_results = []
-    result_files = sorted(results_dir.glob('*.pkl'))
-
-    # Build a map from model_name -> results_file
-    model_file_map = {}
-    for f in result_files:
-        try:
-            _, config, _ = load_results(f)
-            model_name = config['model_name']
-            model_file_map[model_name] = f
-        except Exception as e:
-            print(f"  Could not read {f.name}: {e}")
-
-    baselines_added = set()  # track which lead_times have had baselines added
-
-    for model_name in models:
-        if model_name not in model_file_map:
-            print(f"  {model_name}: no file found — skipping")
-            continue
-
-        results_file = model_file_map[model_name]
-
-        try:
-            print(f"\nProcessing: {results_file.name}")
-            results, config, _ = load_results(results_file)
-            lead_time = config['lead_time']
-
-            # ── Recreate dataset per file ─────────────────────────────────
-            dataset              = recreate_dataset_from_results(results_file)
-            test_window_positions = config['test_indices']
-
-            print(f"  Dataset size: {len(dataset)}, "
-                  f"test samples: {len(test_window_positions)}")
-
-            # ── Pre-compute filtered indices for each subset ──────────────
-            window_pos_to_test_idx = {wp: i for i, wp in enumerate(test_window_positions)}
-            subset_filtered_positions = {}
-
-            for subset_name, filters in subsets.items():
-                filtered_wps = np.array(test_window_positions).copy()
-
-                event_types   = filters.get('event_types')
-                exclude_quiet = filters.get('exclude_quiet', False)
-                forecast_only = filters.get('forecast_only', False)
-
-                if event_types is not None or exclude_quiet or forecast_only:
-                    filtered_wps = dataset.filter_indices_by_event_type(
-                        filtered_wps.tolist(),
-                        event_types=event_types,
-                        exclude_quiet=exclude_quiet,
-                        forecast_only=forecast_only,
-                    )
-
-                min_strength = filters.get('min_strength')
-                max_strength = filters.get('max_strength')
-
-                if min_strength is not None or max_strength is not None:
-                    filtered_wps = dataset.filter_indices_by_storm_strength(
-                        filtered_wps.tolist(),
-                        min_strength=min_strength if min_strength is not None else 0.0,
-                        max_strength=max_strength,
-                    )
-
-                filtered_test_indices = [
-                    window_pos_to_test_idx[wp]
-                    for wp in filtered_wps
-                    if wp in window_pos_to_test_idx
-                ]
-
-                subset_filtered_positions[subset_name] = {
-                    'window_positions': filtered_wps,
-                    'test_indices':     filtered_test_indices,
-                }
-
-            # ── Compute metrics for each subset ───────────────────────────
-            predictions = results[prediction_type]
-            targets     = results['y_test']
-            has_crps    = 'log_mu' in results and 'log_sigma' in results
-
-            for subset_name, indices_dict in subset_filtered_positions.items():
-                filtered_test_indices    = indices_dict['test_indices']
-                filtered_window_positions = indices_dict['window_positions']
-
-                if len(filtered_test_indices) == 0:
-                    continue
-
-                from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
-
-                filtered_preds   = predictions[filtered_test_indices]
-                filtered_targets = targets[filtered_test_indices]
-
-                result_dict = {
-                    'model':           model_name,
-                    'lead_time':       lead_time,
-                    'subset':          subset_name,
-                    'n_samples':       len(filtered_window_positions),
-                    'rmse':            np.sqrt(mean_squared_error(filtered_targets, filtered_preds)),
-                    'mae':             mean_absolute_error(filtered_targets, filtered_preds),
-                    'r2':              r2_score(filtered_targets, filtered_preds),
-                    'mean_target':     float(np.mean(filtered_targets)),
-                    'mean_prediction': float(np.mean(filtered_preds)),
-                }
-
-                if has_crps:
-                    prob_metrics = evaluate_distribution_forecast(
-                        filtered_targets,
-                        distribution='lognormal',
-                        log_mu_pred=results['log_mu'][filtered_test_indices],
-                        log_sigma_pred=results['log_sigma'][filtered_test_indices],
-                    )
-                    result_dict['crps'] = prob_metrics['crps']
-                else:
-                    result_dict['crps'] = np.nan
-
-                all_results.append(result_dict)
-
-            print(f"  {results_file.name}: ✓")
-
-            # ── Baselines (once per lead time) ────────────────────────────
-            if include_baselines and lead_time not in baselines_added:
-                baseline_types = {
-                    'Persistence':       'y_pred_persistence',
-                    '27-Day Recurrence': 'y_pred_27_day_recurrence',
-                    'Persistence Max':   'y_pred_persistence_max',
-                }
-
-                for baseline_name, baseline_key in baseline_types.items():
-                    if baseline_key not in results:
-                        continue
-                    baseline_preds = results[baseline_key]
-
-                    for subset_name, indices_dict in subset_filtered_positions.items():
-                        filtered_test_indices    = indices_dict['test_indices']
-                        filtered_window_positions = indices_dict['window_positions']
-
-                        if len(filtered_test_indices) == 0:
-                            continue
-
-                        fp = baseline_preds[filtered_test_indices]
-                        ft = targets[filtered_test_indices]
-
-                        all_results.append({
-                            'model':           baseline_name,
-                            'lead_time':       lead_time,
-                            'subset':          subset_name,
-                            'n_samples':       len(filtered_window_positions),
-                            'rmse':            np.sqrt(mean_squared_error(ft, fp)),
-                            'mae':             mean_absolute_error(ft, fp),
-                            'r2':              r2_score(ft, fp),
-                            'mean_target':     float(np.mean(ft)),
-                            'mean_prediction': float(np.mean(fp)),
-                            'crps':            np.nan,
-                        })
-
-                baselines_added.add(lead_time)
-                print(f"  Baselines: ✓")
-
-        except Exception as e:
-            print(f"  {model_name}: ERROR — {e}")
-            import traceback
-            traceback.print_exc()
-            continue
-
-    df = pd.DataFrame(all_results)
-
-    if len(df) == 0:
-        print("\nWarning: No results were loaded!")
-        return df
-
-    print(f"\n{'='*80}")
-    print(f"Analysis complete! {len(df)} model-subset combinations")
-    print(f"{'='*80}\n")
-
-    all_models = df['model'].unique().tolist()
-    create_comprehensive_visualization(
-        df, all_models, lead_times, subsets, save, save_dir,
-    )
-
-    if save and save_dir:
-        save_dir.mkdir(parents=True, exist_ok=True)
-        df.to_csv(save_dir / 'comprehensive_results.csv', index=False)
-
-    return df
+def _run_label(file, config):
+    """The identifier that actually distinguishes runs."""
+    return config.get('run_name') or Path(file).stem
 
 
 def auto_detect_and_compare(
@@ -1338,57 +1130,193 @@ def auto_detect_and_compare(
     save: bool = False,
     save_dir: Optional[Path] = None
 ) -> pd.DataFrame:
-    """
-    Automatically detect all models and lead times from files in directory.
-    """
-    import re
-
+    """Detect every result FILE (not deduped model name) and compare them."""
     results_files = sorted(results_dir.glob('*.pkl'))
-    
     if not results_files:
         print(f"No results files found in {results_dir}")
         return pd.DataFrame()
-
     print(f"Found {len(results_files)} result files")
 
-    # Extract unique models and lead times directly from config inside each file
-    models     = []
+    # One record per FILE, labelled by run_name/stem (the thing that varies).
+    runs = []
     lead_times = set()
-
     for file in results_files:
         try:
-            results, config, _ = load_results(file)
-            model_name = config['model_name']
-            lead_time  = config['lead_time']
-
-            if model_name not in models:
-                models.append(model_name)
-            lead_times.add(lead_time)
+            _, config, _ = load_results(file)
+            label = _run_label(file, config)
+            runs.append({'file': file, 'label': label, 'lead_time': config['lead_time']})
+            lead_times.add(config['lead_time'])
         except Exception as e:
             print(f"  Could not load {file.name}: {e}")
             continue
 
-    lead_times = sorted(list(lead_times))
-
-    print("Detected files:")
-    for f in results_files:
-        print(f"  {f.name}")
+    lead_times = sorted(lead_times)
+    print("Detected runs:")
+    for r in runs:
+        print(f"  {r['label']:<40} (lead {r['lead_time']}h)  <- {r['file'].name}")
     print(f"Detected lead times: {lead_times}")
-    
-    # Run comparison
+
     return compare_models_and_lead_times(
         results_dir=results_dir,
-        models=models,
+        runs=runs,                       # pass explicit per-file run records
         lead_times=lead_times,
-        seed=seed,
-        fold=fold,
-        threshold=threshold,
-        test_mode=test_mode,
-        subsets=subsets,
-        include_baselines=include_baselines,
-        save=save,
-        save_dir=save_dir
+        seed=seed, fold=fold, threshold=threshold, test_mode=test_mode,
+        subsets=subsets, include_baselines=include_baselines,
+        save=save, save_dir=save_dir,
     )
+
+
+def compare_models_and_lead_times(
+    results_dir: Path,
+    runs: List[Dict],                    # [{'file','label','lead_time'}, ...] — one per file
+    lead_times: List[int],
+    seed: int = 42,
+    fold: int = 0,
+    threshold: float = 4.5,
+    test_mode: str = 'balanced',
+    prediction_type: str = 'y_pred_lognormal_median',
+    include_baselines: bool = True,
+    subsets: Optional[Dict] = None,
+    save: bool = False,
+    save_dir: Optional[Path] = None,
+) -> pd.DataFrame:
+    """Compare across runs (one per file). Recreates dataset per file."""
+    if subsets is None:
+        subsets = {
+            'All test data': {},
+            'All ICME': {'event_types': ['ICME']},
+            'All SIR': {'event_types': ['SIR']},
+            'Strong storms (>6.5)': {'min_strength': 6.5},
+            'Storms (>4.5)': {'min_strength': 4.5},
+            'No storm (≤4.5)': {'min_strength': 0.0, 'max_strength': 4.5},
+        }
+
+    all_results = []
+    baselines_added = set()
+
+    for run in runs:
+        results_file = run['file']
+        label = run['label']                     # <- distinct per file
+        try:
+            print(f"\nProcessing: {label}  ({results_file.name})")
+            results, config, _ = load_results(results_file)
+            lead_time = config['lead_time']
+
+            dataset = recreate_dataset_from_results(results_file)
+            test_window_positions = config['test_indices']
+            print(f"  Dataset size: {len(dataset)}, test samples: {len(test_window_positions)}")
+
+            window_pos_to_test_idx = {wp: i for i, wp in enumerate(test_window_positions)}
+            subset_filtered_positions = {}
+
+            for subset_name, filters in subsets.items():
+                filtered_wps = np.array(test_window_positions).copy()
+                event_types   = filters.get('event_types')
+                exclude_quiet = filters.get('exclude_quiet', False)
+                forecast_only = filters.get('forecast_only', False)
+                if event_types is not None or exclude_quiet or forecast_only:
+                    filtered_wps = dataset.filter_indices_by_event_type(
+                        filtered_wps.tolist(), event_types=event_types,
+                        exclude_quiet=exclude_quiet, forecast_only=forecast_only)
+                min_strength = filters.get('min_strength')
+                max_strength = filters.get('max_strength')
+                if min_strength is not None or max_strength is not None:
+                    filtered_wps = dataset.filter_indices_by_storm_strength(
+                        filtered_wps.tolist(),
+                        min_strength=min_strength if min_strength is not None else 0.0,
+                        max_strength=max_strength)
+                filtered_test_indices = [
+                    window_pos_to_test_idx[wp] for wp in filtered_wps
+                    if wp in window_pos_to_test_idx]
+                subset_filtered_positions[subset_name] = {
+                    'window_positions': filtered_wps,
+                    'test_indices': filtered_test_indices,
+                }
+
+            predictions = results[prediction_type]
+            targets     = results['y_test']
+            has_crps    = 'log_mu' in results and 'log_sigma' in results
+
+            for subset_name, indices_dict in subset_filtered_positions.items():
+                filtered_test_indices     = indices_dict['test_indices']
+                filtered_window_positions = indices_dict['window_positions']
+                if len(filtered_test_indices) == 0:
+                    continue
+                from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+                filtered_preds   = predictions[filtered_test_indices]
+                filtered_targets = targets[filtered_test_indices]
+                result_dict = {
+                    'model':           label,            # <- per-file label, not model_name
+                    'lead_time':       lead_time,
+                    'subset':          subset_name,
+                    'n_samples':       len(filtered_window_positions),
+                    'rmse':            np.sqrt(mean_squared_error(filtered_targets, filtered_preds)),
+                    'mae':             mean_absolute_error(filtered_targets, filtered_preds),
+                    'r2':              r2_score(filtered_targets, filtered_preds),
+                    'mean_target':     float(np.mean(filtered_targets)),
+                    'mean_prediction': float(np.mean(filtered_preds)),
+                }
+                if has_crps:
+                    prob_metrics = evaluate_distribution_forecast(
+                        filtered_targets, distribution='lognormal',
+                        log_mu_pred=results['log_mu'][filtered_test_indices],
+                        log_sigma_pred=results['log_sigma'][filtered_test_indices])
+                    result_dict['crps'] = prob_metrics['crps']
+                else:
+                    result_dict['crps'] = np.nan
+                all_results.append(result_dict)
+
+            print(f"  {label}: done")
+
+            # Baselines once per lead time (unchanged logic)
+            if include_baselines and lead_time not in baselines_added:
+                baseline_types = {
+                    'Persistence':       'y_pred_persistence',
+                    '27-Day Recurrence': 'y_pred_27_day_recurrence',
+                    'Persistence Max':   'y_pred_persistence_max',
+                }
+                from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+                for baseline_name, baseline_key in baseline_types.items():
+                    if baseline_key not in results:
+                        continue
+                    baseline_preds = results[baseline_key]
+                    for subset_name, indices_dict in subset_filtered_positions.items():
+                        fti = indices_dict['test_indices']
+                        fwp = indices_dict['window_positions']
+                        if len(fti) == 0:
+                            continue
+                        fp = baseline_preds[fti]; ft = targets[fti]
+                        all_results.append({
+                            'model': baseline_name, 'lead_time': lead_time,
+                            'subset': subset_name, 'n_samples': len(fwp),
+                            'rmse': np.sqrt(mean_squared_error(ft, fp)),
+                            'mae': mean_absolute_error(ft, fp),
+                            'r2': r2_score(ft, fp),
+                            'mean_target': float(np.mean(ft)),
+                            'mean_prediction': float(np.mean(fp)),
+                            'crps': np.nan,
+                        })
+                baselines_added.add(lead_time)
+                print(f"  Baselines: done")
+
+        except Exception as e:
+            print(f"  {label}: ERROR — {e}")
+            import traceback
+            traceback.print_exc()
+            continue
+
+    df = pd.DataFrame(all_results)
+    if len(df) == 0:
+        print("\nWarning: No results were loaded!")
+        return df
+
+    print(f"\n{'='*80}\nAnalysis complete! {len(df)} run-subset combinations\n{'='*80}\n")
+    all_models = df['model'].unique().tolist()
+    create_comprehensive_visualization(df, all_models, lead_times, subsets, save, save_dir)
+    if save and save_dir:
+        save_dir.mkdir(parents=True, exist_ok=True)
+        df.to_csv(save_dir / 'comprehensive_results.csv', index=False)
+    return df
     
 
 def plot_lead_time_degradation(results_df: pd.DataFrame, subset: str = 'All test data'):
@@ -1960,7 +1888,7 @@ def auto_detect_and_plot_case_studies(
     for i, results_file in enumerate(result_files, start=1):
         print(results_file.name)
         results, config, _ = load_results(results_file)
-        original_name = config['model_name']
+        original_name = results_file.name
         short_name    = f'Model{i}'
 
         all_results[short_name] = results
