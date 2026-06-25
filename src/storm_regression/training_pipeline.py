@@ -80,6 +80,11 @@ class TwCRPSLossConfig(LossConfig):
     sharpness: float = 2.0
     n_samples: int = 1000
 
+@dataclass
+class MixtureNLLLossConfig(LossConfig):
+    loss_type: str = 'mixture_nll'
+    n_components: int = 2
+
 
 def get_loss_function(loss_config: LossConfig):
     """
@@ -130,6 +135,11 @@ def get_loss_function(loss_config: LossConfig):
                 n_samples=loss_config.n_samples
             )
         return twcrps_loss
+
+    elif loss_config.loss_type == 'mixture_nll':
+        def mix_nll(mu, sigma, weights, y_true):
+            return mixture_nll_loss(mu, sigma, weights, y_true)
+        return mix_nll
             
     else:
         raise ValueError(f"Unknown loss type: {loss_config.loss_type}")
@@ -568,6 +578,36 @@ def fit_distribution_parameters(
     return weibull_params, normal_params, lognormal_params
 
 
+class MixtureLogNormalMLP(nn.Module):
+    """MLP trunk -> K-component LogNormal mixture head.
+
+    Trunk is identical to LogNormalMLP; only the head differs (2 -> 3K outputs).
+    Returns (mu, sigma, weights), each (B, K):
+        mu      : component log-means (no activation)
+        sigma   : component log-sigmas (softplus, floored)
+        weights : mixing weights (softmax, sum to 1 per row)
+    """
+
+    def __init__(self, input_size, hidden_layers=[150, 150, 150], n_components=2):
+        super().__init__()
+        self.K = n_components
+
+        layers, prev = [], input_size
+        for h in hidden_layers:
+            layers += [nn.Linear(prev, h), nn.ReLU()]
+            prev = h
+        self.trunk = nn.Sequential(*layers)
+        self.head = nn.Linear(prev, 3 * self.K)        # 3K instead of 2
+
+    def forward(self, x):
+        raw = self.head(self.trunk(x))                  # (B, 3K)
+        mu      = raw[:, :self.K]                                   # (B, K) no activation
+        sigma   = F.softplus(raw[:, self.K:2 * self.K]) + 1e-3      # (B, K) > 0
+        logits  = raw[:, 2 * self.K:]                               # (B, K) raw weight logits
+        weights = F.softmax(logits, dim=-1)                         # (B, K) sum to 1
+        return mu, sigma, weights
+
+
 class LogNormalMLP(nn.Module):
     """
     MLP that predicts LogNormal distribution parameters (log_mu, log_sigma).
@@ -576,7 +616,7 @@ class LogNormalMLP(nn.Module):
     Output: [log_mu, log_sigma] for LogNormal distribution
     """
     
-    def __init__(self, input_size: int, hidden_layers: List[int] = [50, 50, 50]):
+    def __init__(self, input_size: int, hidden_layers: List[int] = [150, 150, 150]):
         """
         Args:
             input_size: Number of input features
@@ -628,21 +668,26 @@ def negative_log_likelihood_lognormal(
     intensity_weight_strength: float = 1.0
 ):
     """
-    Negative log-likelihood loss for LogNormal distribution.
-    
-    Simplified version - removes constant terms that don't affect gradients.
+    Negative log-likelihood loss for LogNormal distribution (full form).
+
+    Includes the -log(y) Jacobian and the 0.5*log(2*pi) constant so values are
+    comparable to the textbook LogNormal NLL (and to the mixture NLL). These
+    constants do not affect gradients, only the absolute loss value.
     """
     # Avoid log(0) issues
     y_true = torch.clamp(y_true, min=1e-6)
-    
-    # Only the terms that matter for learning
+
     log_y = torch.log(y_true)
-    term_sigma = torch.log(log_sigma_pred)  # Penalizes large sigma
-    term_accuracy = ((log_y - log_mu_pred) ** 2) / (2 * log_sigma_pred ** 2)  # Penalizes errors
-    
-    # Apply term weights
-    nll = (w_sigma * term_sigma) + (w_accuracy * term_accuracy)
-    
+    log_2pi = torch.log(torch.tensor(2.0 * torch.pi, device=y_true.device))
+
+    # Full LogNormal NLL terms (note sign: this is NEGATIVE log-likelihood)
+    term_jacobian = log_y                                  # from -(-log y) = +log y in NLL
+    term_sigma    = torch.log(log_sigma_pred) + 0.5 * log_2pi
+    term_accuracy = ((log_y - log_mu_pred) ** 2) / (2 * log_sigma_pred ** 2)
+
+    # Apply term weights (jacobian + 2pi are constants; left unweighted)
+    nll = term_jacobian + (w_sigma * term_sigma) + (w_accuracy * term_accuracy)
+
     # Apply intensity-based weighting
     if intensity_weight_type == 'none':
         weights = torch.ones_like(y_true)
@@ -666,9 +711,8 @@ def negative_log_likelihood_lognormal(
         )
     else:
         raise ValueError(f"Unknown intensity_weight_type: {intensity_weight_type}")
-    
+
     weighted_nll = nll * weights
-    
     return torch.mean(weighted_nll)
 
 
@@ -696,6 +740,23 @@ def tw_crps_lognormal_loss(log_mu_pred, log_sigma_pred, y_true,
     term1 = torch.mean(torch.abs(v1 - vy), dim=0)      # E|v(X) - v(y)|
     term2 = 0.5 * torch.mean(torch.abs(v1 - v2), dim=0)  # 0.5 E|v(X) - v(X')|
     return torch.mean(term1 - term2)
+
+
+def lognormal_logpdf(y, mu, sigma):
+    """log density of LogNormal(mu, sigma) at y. y:(B,1) broadcasts vs mu/sigma:(B,K)."""
+    y = torch.clamp(y, min=1e-6)
+    logy = torch.log(y)
+    log_2pi = torch.log(torch.tensor(2.0 * torch.pi))
+    return -logy - torch.log(sigma) - 0.5 * log_2pi - 0.5 * ((logy - mu) / sigma) ** 2
+
+
+def mixture_nll_loss(mu, sigma, weights, y_true):
+    """NLL of a K-component LogNormal mixture. mu/sigma/weights:(B,K), y_true:(B,)."""
+    y = y_true.unsqueeze(1)
+    log_comp = lognormal_logpdf(y, mu, sigma)
+    log_weighted = torch.log(weights + 1e-12) + log_comp
+    log_p = torch.logsumexp(log_weighted, dim=1)
+    return -torch.mean(log_p)
 
 
 def crps_lognormal_loss(
@@ -1022,7 +1083,16 @@ def train_mlp(
     logger.info(f"Cached features for {n} windows once (was rebuilt every epoch)")
 
     # ---- model / optimizer / loss ----
-    model = LogNormalMLP(input_size, hidden_layers=architecture).to(device)
+    # check for if we are building a mixture model
+    is_mixture = getattr(loss_config, 'n_components', 1) > 1
+
+    # build the right model
+    if is_mixture:
+        model = MixtureLogNormalMLP(input_size, hidden_layers=architecture,
+                                    n_components=loss_config.n_components).to(device)
+    else:
+        model = LogNormalMLP(input_size, hidden_layers=architecture).to(device)
+
     logger.info(f"Total trainable parameters: {sum(p.numel() for p in model.parameters()):,}")
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
 
@@ -1046,13 +1116,19 @@ def train_mlp(
             sel = perm[start:start + batch_size]
 
             t = time.time()
-            log_mu_pred, log_sigma_pred = model(X_all[sel])
-            loss = loss_fn(log_mu_pred, log_sigma_pred, y_all[sel])
+            out = model(X_all[sel])
+            if is_mixture:
+                mu, sigma, weights = out
+                loss = loss_fn(mu, sigma, weights, y_all[sel])
+            else:
+                log_mu, log_sigma = out
+                loss = loss_fn(log_mu, log_sigma, y_all[sel])
             t_fwd += time.time() - t
 
             t = time.time()
             optimizer.zero_grad()
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
             optimizer.step()
             t_bwd += time.time() - t
 
@@ -1088,7 +1164,7 @@ def train_mlp(
 
 
 def evaluate_mlp_test_set(
-    model: LogNormalMLP,
+    model,
     test_dataloader: DataLoader,
     scaler: DataScaler,
     n_ensembles: int = 100,
@@ -1100,25 +1176,27 @@ def evaluate_mlp_test_set(
     device: str = 'cpu'
 ) -> Dict[str, np.ndarray]:
     """
-    Evaluate MLP on test set.
-    
-    Args:
-        model: Trained LogNormalMLP
-        test_dataloader: DataLoader for test data
-        scaler: Fitted DataScaler
-        n_ensembles: Number of ensemble members
-        include_ensemble_spread: Whether ensemble statistics were used
-        device: Device for inference
-        
-    Returns:
-        Dictionary of results
+    Evaluate an MLP on the test set. Supports BOTH the single-LogNormal head
+    (returns log_mu, log_sigma) and the mixture head (returns mu, sigma, weights),
+    detected by the number of outputs the model returns.
+
+    The mixture path emits a SUPERSET of the single-LogNormal keys:
+      - mixture_mu, mixture_sigma, mixture_weights  (the full (B, K) mixture)
+      - y_pred_lognormal_median                     (mixture median, reuses the key
+                                                      so deterministic metrics work)
+      - log_mu / log_sigma                          (the highest-weight component's
+                                                      params, so the existing lognormal
+                                                      CRPS/metrics block does not KeyError;
+                                                      the dashboard uses the mixture keys)
     """
     model.eval()
     all_outputs = []
-    
+
+    # detect mixture by attribute set on the model class (K = n_components)
+    is_mixture = hasattr(model, 'K') and getattr(model, 'K', 1) > 1
+
     with torch.no_grad():
         for batch in tqdm(test_dataloader, desc="Test batches"):
-            # Prepare features
             X, _ = prepare_mlp_features(
                 batch, n_ensembles,
                 include_ensemble_spread=include_ensemble_spread,
@@ -1129,53 +1207,78 @@ def evaluate_mlp_test_set(
                 scaler=scaler,
                 fit_scaler=False
             )
-            
-            # Convert to torch
             X_torch = torch.FloatTensor(X).to(device)
-            
-            # Predict
-            log_mu_pred, log_sigma_pred = model(X_torch)
-            
-            # Convert to numpy
-            log_mu_np = log_mu_pred.cpu().numpy()
-            log_sigma_np = log_sigma_pred.cpu().numpy()
-            
-            # Compute median (deterministic forecast)
-            lognormal_median = np.exp(log_mu_np)
-            
-            # Extract additional data
+
+            out = model(X_torch)
+
+            # ---- shared batch extras ----
             hist = batch['historic_target'].cpu().numpy().squeeze(axis=-1)
             y_true = batch['max_target'].cpu().numpy()
             recurrence = batch['27_day_target'].cpu().numpy().squeeze(axis=-1)
             center_indices = batch['center_idx'].cpu().numpy()
-            
-            # Ensure proper shapes
             if recurrence.ndim == 1:
                 recurrence = recurrence.reshape(-1, 1)
-            
-            # Baseline forecasts
             y_pred_persistence = hist[:, -1]
             y_pred_persistence_max = np.max(hist, axis=-1)
             y_pred_27_day = np.max(recurrence, axis=-1)
-            
-            all_outputs.append({
-                'y_test': y_true.ravel(),
-                'y_pred_lognormal_median': lognormal_median,
-                'y_pred_persistence': y_pred_persistence,
-                'y_pred_persistence_max': y_pred_persistence_max,
-                'y_pred_27_day_recurrence': y_pred_27_day,
-                'log_mu': log_mu_np,
-                'log_sigma': log_sigma_np,
-                'center_idx': center_indices,
-            })
-    
+
+            if is_mixture:
+                mu, sigma, weights = out
+                mu_np     = mu.cpu().numpy()        # (B, K)
+                sigma_np  = sigma.cpu().numpy()     # (B, K)
+                w_np      = weights.cpu().numpy()   # (B, K)
+
+                # Mixture median via the predictive abstraction (weighted-CDF inversion).
+                from storm_regression.predictive import MixtureForecast, LogNormalForecast
+                K = mu_np.shape[1]
+                components = [LogNormalForecast(mu_np[:, k], sigma_np[:, k]) for k in range(K)]
+                fcst = MixtureForecast(components, w_np)
+                mixture_median = fcst.median()
+
+                # Fallback single-LogNormal params = the highest-weight component, so the
+                # existing 'lognormal_median' metrics block (which reads log_mu/log_sigma)
+                # still runs without KeyError. The dashboard uses the mixture_* keys.
+                top = np.argmax(w_np, axis=1)        # (B,)
+                rows = np.arange(mu_np.shape[0])
+                log_mu_np    = mu_np[rows, top]
+                log_sigma_np = sigma_np[rows, top]
+
+                all_outputs.append({
+                    'y_test': y_true.ravel(),
+                    'y_pred_lognormal_median': mixture_median,
+                    'y_pred_persistence': y_pred_persistence,
+                    'y_pred_persistence_max': y_pred_persistence_max,
+                    'y_pred_27_day_recurrence': y_pred_27_day,
+                    'mu_m': mu_np,            # was mixture_mu
+                    'sigma_m': sigma_np,      # was mixture_sigma
+                    'alpha': w_np,            # was mixture_weights
+                    'log_mu': log_mu_np,      # top-component fallback (keeps the metrics block alive)
+                    'log_sigma': log_sigma_np,
+                    'center_idx': center_indices,
+                })
+            else:
+                log_mu_pred, log_sigma_pred = out
+                log_mu_np = log_mu_pred.cpu().numpy()
+                log_sigma_np = log_sigma_pred.cpu().numpy()
+                lognormal_median = np.exp(log_mu_np)
+
+                all_outputs.append({
+                    'y_test': y_true.ravel(),
+                    'y_pred_lognormal_median': lognormal_median,
+                    'y_pred_persistence': y_pred_persistence,
+                    'y_pred_persistence_max': y_pred_persistence_max,
+                    'y_pred_27_day_recurrence': y_pred_27_day,
+                    'log_mu': log_mu_np,
+                    'log_sigma': log_sigma_np,
+                    'center_idx': center_indices,
+                })
+
     # Concatenate results
     results = {}
     for key in all_outputs[0]:
         results[key] = np.concatenate([d[key] for d in all_outputs], axis=0)
-    
+
     results['window_idx'] = results['center_idx']
-    
     return results
     
 
