@@ -1028,7 +1028,7 @@ def plot_ensemble_comparison_from_files(
     huxt_id : int, optional
         HUXt run ID
     """
-    from storm_regression.case_study_analysis import load_results
+    from storm_regression.results_io import load_results
     
     # Load all results
     results_dict = {}
@@ -1075,7 +1075,7 @@ def compare_top_n_storms(
     huxt_id : int, optional
         HUXt run ID
     """
-    from storm_regression.case_study_analysis import load_results
+    from storm_regression.results_io import load_results
     
     # Load first model for ranking
     first_model = list(results_files.keys())[0]
@@ -1139,7 +1139,7 @@ def plot_distribution_params_joint(
     >>> results_file = results_folder / 'results_seed42_..._LinearRegression.pkl'
     >>> plot_distribution_params_joint(results_file, aggregator='weibull_median')
     """
-    from storm_regression.case_study_analysis import load_results
+    from storm_regression.results_io import load_results
     from storm_regression.training_pipeline import fit_distribution_parameters, constrain_predictions
     
     # Load results
@@ -1407,7 +1407,7 @@ def compare_distribution_params_across_models(
     ... }
     >>> compare_distribution_params_across_models(files, aggregator='weibull_median')
     """
-    from storm_regression.case_study_analysis import load_results
+    from storm_regression.results_io import load_results
     from storm_regression.training_pipeline import fit_distribution_parameters, constrain_predictions
     
     n_models = len(results_files)

@@ -27,7 +27,7 @@ import pandas as pd
 from scipy.stats import kstest
 
 from storm_regression.predictive import forecast_from_results
-from storm_regression.case_study_analysis import load_results
+from storm_regression.results_io import load_results
 
 METRICS = ["CRPS_all", "CRPS_storm", "Brier_storm", "PITKS_all", "PITKS_storm"]
 

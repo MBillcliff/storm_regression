@@ -12,7 +12,8 @@ import os
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score, explained_variance_score
 from typing import Dict, List, Optional, Tuple, Callable
 from pathlib import Path
-from storm_regression.case_study_analysis import analyze_results, load_results, recreate_dataset_from_results
+from storm_regression.case_study_analysis import analyze_results
+from storm_regression.results_io import load_results, recreate_dataset_from_results
 from storm_regression.plotting import plot_comparative_case_study
 import pickle
 import logging
@@ -1945,31 +1946,6 @@ def auto_detect_and_plot_case_studies(
         'dataset':                   shared_dataset,
         'model_name_map':            model_name_map,
     }
-
-
-"""
-plot_distribution_parameters — redesigned to show the storm-strength-conditional
-behaviour that matters for the twCRPS comparison.
-
-Drop-in replacement. Key changes vs the scatter version:
-  * accepts ONE file or MANY (overlay losses: nll vs crps vs twcrps) so the
-    before/after is visible on one figure.
-  * BINS by y_true (storm strength) -> trends become legible lines, not point clouds.
-  * Panel 1  predicted median vs strength   (is the CENTRE right? -> undershoot/regression)
-  * Panel 2  sigma vs strength              (does spread RISE on storms? the inversion check)
-  * Panel 3  std of standardized residual z=(ln y - mu)/sigma per bin
-             (is sigma the RIGHT SIZE? z-std ~1 = calibrated, >1 = under-dispersed)
-  * prints the storm-vs-quiet diagnostic table (obs/pred means, sigma gap, corr, std ratio).
-
-For the single-LogNormal head only (reads log_mu/log_sigma). The mixture head (Phase 3)
-needs a mixture-aware version.
-"""
-
-from pathlib import Path
-import numpy as np
-import matplotlib.pyplot as plt
-
-from storm_regression.case_study_analysis import load_results, recreate_dataset_from_results
 
 
 def _filter_indices(results, config, dataset, event_types, min_strength, max_strength, exclude_quiet):

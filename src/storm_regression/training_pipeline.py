@@ -33,7 +33,7 @@ from tqdm import tqdm
 from storm_utils.data_structure import ForecastingDataset, ForecastingConfig
 from storm_utils.config_paths import get_project_paths
 from storm_regression.forecast_analysis import evaluate_regression_forecast, evaluate_distribution_forecast
-from storm_regression.case_study_analysis import save_results
+from storm_regression.results_io import save_results
 
 
 # Configure logging
