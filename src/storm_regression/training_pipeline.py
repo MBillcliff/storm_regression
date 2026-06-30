@@ -1013,16 +1013,19 @@ def train_mlp(
     loss_config=None,
     device: str = 'cpu',
     patience: int = 10,
-    batch_size: int = 256,      # NEW: minibatch size over the cached tensors
-    debug: bool = False,        # NEW: print shapes + per-epoch fwd/bwd timing
+    batch_size: int = 256,
+    val_fraction: float = 0.15,     # NEW: held-out fraction of TRAIN windows for early stopping
+    weight_decay: float = 0.0,      # NEW: optional L2 regularisation (Adam weight_decay)
+    val_seed: int = 0,              # NEW: seed for the reproducible train/val split
+    debug: bool = False,
 ) -> Tuple['LogNormalMLP', 'MinMaxScaler']:
-    """Train MLP to predict LogNormal distribution parameters.
+    """Train MLP to predict (mixture) LogNormal parameters.
 
-    Features are built ONCE (cached) before the epoch loop instead of being rebuilt
-    every batch of every epoch. Scaler is fit on the first batch (same as the original),
-    then all features are transformed with it and concatenated into device tensors.
+    Early stopping now watches a held-out VALIDATION slice of the training windows
+    (val_fraction), not the training loss — so training stops near the generalisation
+    optimum rather than where training loss plateaus. The best-validation weights are
+    restored before returning. The TEST set is never touched here.
     """
-    # ---- validate batch_size (a bad value here was the empty-data crash) ----
     if not isinstance(batch_size, int) or batch_size <= 0:
         if debug:
             print(f"DEBUG: bad batch_size={batch_size!r}; defaulting to 256")
@@ -1036,13 +1039,13 @@ def train_mlp(
         include_ensemble_spread=include_ensemble_spread,
     )
 
-    # ---- fit scaler ONCE on the first batch (matches the original semantics) ----
+    # ---- fit scaler ONCE on the first batch ----
     first_batch = next(iter(train_dataloader))
     _, scaler = prepare_mlp_features(
         first_batch, n_ensembles, fit_scaler=True, **feat_kwargs
     )
 
-    # ---- cache ALL training features using that scaler (fit_scaler=False) ----
+    # ---- cache ALL training features using that scaler ----
     X_list, y_list = [], []
     for bi, batch in enumerate(train_dataloader):
         X, _ = prepare_mlp_features(
@@ -1062,31 +1065,34 @@ def train_mlp(
 
     X_all = torch.as_tensor(np.concatenate(X_list, axis=0), dtype=torch.float32, device=device)
     y_all = torch.as_tensor(np.concatenate(y_list, axis=0), dtype=torch.float32, device=device)
-    n = X_all.shape[0]
+    n_total = X_all.shape[0]
     input_size = X_all.shape[1]
 
-    if debug:
-        print(f"DEBUG: cached n={n}, input_size={input_size}, "
-              f"batch_size={batch_size}, n_batches/epoch={int(np.ceil(n / batch_size))}, "
-              f"X_all {tuple(X_all.shape)} ({X_all.element_size()*X_all.nelement()/1e6:.1f} MB)")
+    if n_total == 0:
+        raise RuntimeError("train_mlp: cached feature tensor is empty (n=0).")
 
-    if n == 0:
-        raise RuntimeError(
-            f"train_mlp: cached feature tensor is empty (n=0) although "
-            f"{len(X_list)} batch(es) were collected — check prepare_mlp_features output."
-        )
+    # ---- split cached windows into train / validation (random, reproducible) ----
+    # Random split is adequate for early stopping: a slightly optimistic val loss still
+    # locates the turning point. The honest skill estimate comes from the TEST set.
+    g = torch.Generator(device='cpu').manual_seed(val_seed)
+    perm0 = torch.randperm(n_total, generator=g).to(device)
+    n_val = max(1, int(round(val_fraction * n_total))) if val_fraction > 0 else 0
+    val_idx = perm0[:n_val]
+    tr_idx = perm0[n_val:]
+    n_tr = tr_idx.numel()
+
+    X_tr, y_tr = X_all[tr_idx], y_all[tr_idx]
+    X_val, y_val = X_all[val_idx], y_all[val_idx]
 
     logger.info(f"Input size: {input_size}")
-    logger.info(f"Architecture: {input_size} → {' → '.join(map(str, architecture))} → 2")
+    logger.info(f"Architecture: {input_size} -> {' -> '.join(map(str, architecture))} -> 2")
     logger.info(f"Using percentiles: {ensemble_percentiles}")
     logger.info(f"Including spread metrics: {include_ensemble_spread}")
-    logger.info(f"Cached features for {n} windows once (was rebuilt every epoch)")
+    logger.info(f"Cached {n_total} windows; train {n_tr}, val {n_val} "
+                f"(val_fraction={val_fraction})")
 
     # ---- model / optimizer / loss ----
-    # check for if we are building a mixture model
     is_mixture = getattr(loss_config, 'n_components', 1) > 1
-
-    # build the right model
     if is_mixture:
         model = MixtureLogNormalMLP(input_size, hidden_layers=architecture,
                                     n_components=loss_config.n_components).to(device)
@@ -1094,72 +1100,72 @@ def train_mlp(
         model = LogNormalMLP(input_size, hidden_layers=architecture).to(device)
 
     logger.info(f"Total trainable parameters: {sum(p.numel() for p in model.parameters()):,}")
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
 
     if loss_config is None:
         loss_config = NLLLossConfig()
     loss_fn = get_loss_function(loss_config)
     logger.info(f"Loss function: {loss_config.loss_type} — config: {vars(loss_config)}")
 
-    # ---- training loop over cached tensors ----
-    best_loss = float('inf')
+    def compute_loss(out, y):
+        if is_mixture:
+            mu, sigma, weights = out
+            return loss_fn(mu, sigma, weights, y)
+        log_mu, log_sigma = out
+        return loss_fn(log_mu, log_sigma, y)
+
+    # ---- training loop with validation-based early stopping ----
+    best_val = float('inf')
+    best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+    best_epoch = 0
     patience_counter = 0
 
     for epoch in range(n_epochs):
+        # --- train pass ---
         model.train()
-        perm = torch.randperm(n, device=device)     # reshuffle each epoch
-        epoch_loss = 0.0
-        n_batches = 0
-        t0 = time.time(); t_fwd = 0.0; t_bwd = 0.0
-
-        for start in range(0, n, batch_size):
+        perm = torch.randperm(n_tr, device=device)
+        epoch_loss, n_batches = 0.0, 0
+        for start in range(0, n_tr, batch_size):
             sel = perm[start:start + batch_size]
-
-            t = time.time()
-            out = model(X_all[sel])
-            if is_mixture:
-                mu, sigma, weights = out
-                loss = loss_fn(mu, sigma, weights, y_all[sel])
-            else:
-                log_mu, log_sigma = out
-                loss = loss_fn(log_mu, log_sigma, y_all[sel])
-            t_fwd += time.time() - t
-
-            t = time.time()
+            out = model(X_tr[sel])
+            loss = compute_loss(out, y_tr[sel])
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
             optimizer.step()
-            t_bwd += time.time() - t
-
             epoch_loss += loss.item()
             n_batches += 1
+        avg_train = epoch_loss / max(n_batches, 1)
 
-        if n_batches == 0:
-            raise RuntimeError(
-                f"train_mlp: no minibatches ran (n={n}, batch_size={batch_size})."
-            )
-
-        avg_loss = epoch_loss / n_batches
-
-        if debug and (epoch < 2 or (epoch + 1) % 10 == 0):
-            print(f"DEBUG epoch {epoch+1}: {time.time()-t0:.3f}s total | "
-                  f"fwd+loss {t_fwd:.3f}s | bwd {t_bwd:.3f}s | {n_batches} batches")
+        # --- validation pass (no grad) ---
+        if n_val > 0:
+            model.eval()
+            with torch.no_grad():
+                val_loss = compute_loss(model(X_val), y_val).item()
+        else:
+            val_loss = avg_train   # no val set -> fall back to train loss
 
         if (epoch + 1) % 10 == 0:
-            logger.info(f"Epoch {epoch+1}/{n_epochs}, Loss: {avg_loss:.4f}")
+            logger.info(f"Epoch {epoch+1}/{n_epochs}, "
+                        f"train: {avg_train:.4f}, val: {val_loss:.4f}")
 
-        # early stopping
-        if avg_loss < best_loss:
-            best_loss = avg_loss
+        # --- early stopping on VALIDATION loss, with best-weight capture ---
+        if val_loss < best_val:
+            best_val = val_loss
+            best_epoch = epoch + 1
+            best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
             patience_counter = 0
         else:
             patience_counter += 1
             if patience_counter >= patience:
-                logger.info(f"Early stopping at epoch {epoch+1}")
+                logger.info(f"Early stopping at epoch {epoch+1} "
+                            f"(best val {best_val:.4f} at epoch {best_epoch})")
                 break
 
-    logger.info(f"Training complete. Best loss: {best_loss:.4f}")
+    # ---- restore best-validation weights ----
+    model.load_state_dict(best_state)
+    logger.info(f"Training complete. Best val loss: {best_val:.4f} (epoch {best_epoch}); "
+                f"restored best weights.")
     return model, scaler
 
 
