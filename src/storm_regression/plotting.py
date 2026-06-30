@@ -2152,6 +2152,39 @@ def plot_metric_heatmap(
     return pivot
 
 
+def plot_loss_curve(results_path, save=False, save_name=None, huxt_id=None):
+    """Plot train vs validation loss per epoch from a saved run, marking the
+    best-validation epoch (where early stopping restored weights)."""
+    from storm_regression.results_io import load_results
+    results, config, _ = load_results(results_path)
+
+    hist = results.get('loss_history')
+    if not hist:
+        print("No 'loss_history' in this results file "
+              "(was it trained before loss-history saving was added?).")
+        return
+
+    train = hist['train']; val = hist['val']
+    best_epoch = hist.get('best_epoch'); best_val = hist.get('best_val')
+    epochs = range(1, len(train) + 1)
+
+    fig, ax = plt.subplots(figsize=(9, 5))
+    ax.plot(epochs, train, label='train', color='steelblue', lw=2)
+    ax.plot(epochs, val,   label='validation', color='darkorange', lw=2)
+    if best_epoch is not None:
+        ax.axvline(best_epoch, color='red', ls='--', alpha=0.7,
+                   label=f'best val (epoch {best_epoch}, {best_val:.3f})')
+    ax.set_xlabel('Epoch', fontsize=12)
+    ax.set_ylabel('Loss (NLL)', fontsize=12)
+    ax.set_title(f"Training curve — {config.get('run_name', config.get('model_name',''))}",
+                 fontsize=13)
+    ax.legend(); ax.grid(alpha=0.3)
+    plt.tight_layout()
+    if save and save_name:
+        save_figure(save_name, subfolder='training_curves', huxt_id=huxt_id)
+    plt.show()
+
+
 # ============================================================================
 # Example Usage
 # ============================================================================

@@ -1119,6 +1119,7 @@ def train_mlp(
     best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
     best_epoch = 0
     patience_counter = 0
+    train_history, val_history = [], []
 
     for epoch in range(n_epochs):
         # --- train pass ---
@@ -1145,6 +1146,9 @@ def train_mlp(
         else:
             val_loss = avg_train   # no val set -> fall back to train loss
 
+        train_history.append(avg_train)
+        val_history.append(val_loss)
+
         if (epoch + 1) % 10 == 0:
             logger.info(f"Epoch {epoch+1}/{n_epochs}, "
                         f"train: {avg_train:.4f}, val: {val_loss:.4f}")
@@ -1163,10 +1167,12 @@ def train_mlp(
                 break
 
     # ---- restore best-validation weights ----
+    history = {'train': train_history, 'val': val_history,
+               'best_epoch': best_epoch, 'best_val': best_val}
     model.load_state_dict(best_state)
     logger.info(f"Training complete. Best val loss: {best_val:.4f} (epoch {best_epoch}); "
                 f"restored best weights.")
-    return model, scaler
+    return model, scaler, history
 
 
 def evaluate_mlp_test_set(
@@ -1557,7 +1563,7 @@ def run_training_pipeline(config: TrainingConfig):
                         )
                         
                         # Train MLP
-                        mlp_model, scaler = train_mlp(
+                        mlp_model, scaler, loss_history = train_mlp(
                             train_dataloader,
                             config.n_ensembles,
                             loss_config=config.loss_config,
@@ -1626,7 +1632,7 @@ def run_training_pipeline(config: TrainingConfig):
                             batch_size=config.batch_size,
                             shuffle=False
                         )
-                        
+
                         # Evaluate based on model type
                         if config.model_type == 'mlp':
                             results = evaluate_mlp_test_set(
@@ -1641,6 +1647,7 @@ def run_training_pipeline(config: TrainingConfig):
                                 n_ensemble_keep=config.n_ensemble_keep,
                                 device=config.mlp_device,
                             )
+                            results['loss_history'] = loss_history
                         else:
                             results = evaluate_test_set(
                                 model_or_models,
