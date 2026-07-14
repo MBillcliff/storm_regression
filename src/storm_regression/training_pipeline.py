@@ -991,16 +991,9 @@ def prepare_mlp_features(
     return features_scaled, scaler
 
 
-import time
-import numpy as np
-import torch
-import torch.optim as optim
-from torch.utils.data import DataLoader
-from typing import List, Tuple
-
-
 def train_mlp(
     train_dataloader: DataLoader,
+    val_dataloader: DataLoader,          # NEW: explicit, rotation-aligned val set
     n_ensembles: int,
     filter_ensemble: bool = False,
     n_ensemble_keep: int = 50,
@@ -1014,17 +1007,15 @@ def train_mlp(
     device: str = 'cpu',
     patience: int = 10,
     batch_size: int = 256,
-    val_fraction: float = 0.15,     # NEW: held-out fraction of TRAIN windows for early stopping
-    weight_decay: float = 0.0,      # NEW: optional L2 regularisation (Adam weight_decay)
-    val_seed: int = 0,              # NEW: seed for the reproducible train/val split
+    weight_decay: float = 0.0,
     debug: bool = False,
-) -> Tuple['LogNormalMLP', 'MinMaxScaler']:
+) -> Tuple['LogNormalMLP', 'MinMaxScaler', dict]:
     """Train MLP to predict (mixture) LogNormal parameters.
 
-    Early stopping now watches a held-out VALIDATION slice of the training windows
-    (val_fraction), not the training loss — so training stops near the generalisation
-    optimum rather than where training loss plateaus. The best-validation weights are
-    restored before returning. The TEST set is never touched here.
+    Early stopping watches a rotation-aligned VALIDATION set (passed in as
+    ``val_dataloader``), constructed by the same leakage-safe block split as the
+    test set — NOT a random slice of the training windows. Best-validation
+    weights are restored before returning. The TEST set is never touched here.
     """
     if not isinstance(batch_size, int) or batch_size <= 0:
         if debug:
@@ -1039,59 +1030,45 @@ def train_mlp(
         include_ensemble_spread=include_ensemble_spread,
     )
 
-    # ---- fit scaler ONCE on the first batch ----
+    # ---- fit scaler ONCE on the first TRAIN batch ----
     first_batch = next(iter(train_dataloader))
     _, scaler = prepare_mlp_features(
         first_batch, n_ensembles, fit_scaler=True, **feat_kwargs
     )
 
-    # ---- cache ALL training features using that scaler ----
-    X_list, y_list = [], []
-    for bi, batch in enumerate(train_dataloader):
-        X, _ = prepare_mlp_features(
-            batch, n_ensembles, scaler=scaler, fit_scaler=False, **feat_kwargs
-        )
-        y = batch['max_target'].numpy()
-        if debug and bi == 0:
-            print(f"DEBUG: first cached batch -> X {np.asarray(X).shape}, y {np.asarray(y).shape}")
-        X_list.append(np.asarray(X))
-        y_list.append(np.asarray(y))
+    def _cache(dataloader, name):
+        X_list, y_list = [], []
+        for bi, batch in enumerate(dataloader):
+            X, _ = prepare_mlp_features(
+                batch, n_ensembles, scaler=scaler, fit_scaler=False, **feat_kwargs
+            )
+            y = batch['max_target'].numpy()
+            X_list.append(np.asarray(X))
+            y_list.append(np.asarray(y))
+        if len(X_list) == 0:
+            raise RuntimeError(
+                f"train_mlp: {name} dataloader yielded no batches — "
+                f"{name} set is empty (check the fold split / filters upstream)."
+            )
+        X = torch.as_tensor(np.concatenate(X_list, axis=0), dtype=torch.float32, device=device)
+        y = torch.as_tensor(np.concatenate(y_list, axis=0), dtype=torch.float32, device=device)
+        return X, y
 
-    if len(X_list) == 0:
-        raise RuntimeError(
-            "train_mlp: dataloader yielded no batches — training set is empty "
-            "(check the fold split / CME removal / filters upstream)."
-        )
+    # ---- cache TRAIN and VAL features with the SAME scaler ----
+    X_tr, y_tr = _cache(train_dataloader, "train")
+    X_val, y_val = _cache(val_dataloader, "val")
 
-    X_all = torch.as_tensor(np.concatenate(X_list, axis=0), dtype=torch.float32, device=device)
-    y_all = torch.as_tensor(np.concatenate(y_list, axis=0), dtype=torch.float32, device=device)
-    n_total = X_all.shape[0]
-    input_size = X_all.shape[1]
-
-    if n_total == 0:
-        raise RuntimeError("train_mlp: cached feature tensor is empty (n=0).")
-
-    # ---- split cached windows into train / validation (random, reproducible) ----
-    # Random split is adequate for early stopping: a slightly optimistic val loss still
-    # locates the turning point. The honest skill estimate comes from the TEST set.
-    g = torch.Generator(device='cpu').manual_seed(val_seed)
-    perm0 = torch.randperm(n_total, generator=g).to(device)
-    n_val = max(1, int(round(val_fraction * n_total))) if val_fraction > 0 else 0
-    val_idx = perm0[:n_val]
-    tr_idx = perm0[n_val:]
-    n_tr = tr_idx.numel()
-
-    X_tr, y_tr = X_all[tr_idx], y_all[tr_idx]
-    X_val, y_val = X_all[val_idx], y_all[val_idx]
+    n_tr = X_tr.shape[0]
+    n_val = X_val.shape[0]
+    input_size = X_tr.shape[1]
 
     logger.info(f"Input size: {input_size}")
     logger.info(f"Architecture: {input_size} -> {' -> '.join(map(str, architecture))} -> 2")
     logger.info(f"Using percentiles: {ensemble_percentiles}")
     logger.info(f"Including spread metrics: {include_ensemble_spread}")
-    logger.info(f"Cached {n_total} windows; train {n_tr}, val {n_val} "
-                f"(val_fraction={val_fraction})")
+    logger.info(f"Cached train {n_tr}, val {n_val} (rotation-aligned val set)")
 
-    # ---- model / optimizer / loss ----
+    # ---- model / optimizer / loss ----  (UNCHANGED from your version below)
     is_mixture = getattr(loss_config, 'n_components', 1) > 1
     if is_mixture:
         model = MixtureLogNormalMLP(input_size, hidden_layers=architecture,
@@ -1114,7 +1091,6 @@ def train_mlp(
         log_mu, log_sigma = out
         return loss_fn(log_mu, log_sigma, y)
 
-    # ---- training loop with validation-based early stopping ----
     best_val = float('inf')
     best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
     best_epoch = 0
@@ -1122,7 +1098,6 @@ def train_mlp(
     train_history, val_history = [], []
 
     for epoch in range(n_epochs):
-        # --- train pass ---
         model.train()
         perm = torch.randperm(n_tr, device=device)
         epoch_loss, n_batches = 0.0, 0
@@ -1138,22 +1113,16 @@ def train_mlp(
             n_batches += 1
         avg_train = epoch_loss / max(n_batches, 1)
 
-        # --- validation pass (no grad) ---
-        if n_val > 0:
-            model.eval()
-            with torch.no_grad():
-                val_loss = compute_loss(model(X_val), y_val).item()
-        else:
-            val_loss = avg_train   # no val set -> fall back to train loss
+        model.eval()
+        with torch.no_grad():
+            val_loss = compute_loss(model(X_val), y_val).item()
 
         train_history.append(avg_train)
         val_history.append(val_loss)
 
         if (epoch + 1) % 10 == 0:
-            logger.info(f"Epoch {epoch+1}/{n_epochs}, "
-                        f"train: {avg_train:.4f}, val: {val_loss:.4f}")
+            logger.info(f"Epoch {epoch+1}/{n_epochs}, train: {avg_train:.4f}, val: {val_loss:.4f}")
 
-        # --- early stopping on VALIDATION loss, with best-weight capture ---
         if val_loss < best_val:
             best_val = val_loss
             best_epoch = epoch + 1
@@ -1166,7 +1135,6 @@ def train_mlp(
                             f"(best val {best_val:.4f} at epoch {best_epoch})")
                 break
 
-    # ---- restore best-validation weights ----
     history = {'train': train_history, 'val': val_history,
                'best_epoch': best_epoch, 'best_val': best_val}
     model.load_state_dict(best_state)
@@ -1506,15 +1474,16 @@ def run_training_pipeline(config: TrainingConfig):
                     forecast_duration_hours=config.forecast_duration_hours,
                     stride_hours=config.stride_hours
                 )
-                
-                # Balance storms
-                if config.balance:
-                    logger.info("Balancing storm/non-storm samples...")
-                    dataset.balance_storms(
-                        threshold=config.storm_balance_threshold,
-                        inplace=True,
-                        random_state=random_seed
-                    )
+
+                # # OBSOLETE
+                # # Balance storms
+                # if config.balance:
+                #     logger.info("Balancing storm/non-storm samples...")
+                #     dataset.balance_storms(
+                #         threshold=config.storm_balance_threshold,
+                #         inplace=True,
+                #         random_state=random_seed
+                #     )
 
                 if config.remove_cmes:
                     logger.info("Removing CME samples...")
@@ -1536,12 +1505,11 @@ def run_training_pipeline(config: TrainingConfig):
                 logger.info(f"Test Fold: {test_fold}")
 
                 try:
-                    # Split data
-                    train_indices, test_indices = dataset.rotation_aligned_train_test_split(
-                        train_ratio=config.train_ratio,
-                        test_fold=test_fold
+                    train_indices, val_indices, test_indices = dataset.rotation_aligned_train_val_test_split(
+                        test_fold=test_fold,
+                        n_groups=5,
+                        buffer_margin_hours=0.0,   # strict minimum; rotation-scale gap handles autocorrelation
                     )
-                    
                 except Exception as e:
                     logger.error(f"Failed to split data: {e}")
                     continue
@@ -1553,25 +1521,23 @@ def run_training_pipeline(config: TrainingConfig):
                     # ===== BRANCH: MLP vs Ensemble =====
                     if config.model_type == 'mlp':
                         logger.info("Using MLP model")
-                        
-                        # Create dataloaders
+                     
                         train_dataset = Subset(dataset, train_indices)
-                        train_dataloader = DataLoader(
-                            train_dataset,
-                            batch_size=config.batch_size,
-                            shuffle=True
-                        )
-                        
-                        # Train MLP
+                        val_dataset   = Subset(dataset, val_indices)
+                     
+                        train_dataloader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True)
+                        val_dataloader   = DataLoader(val_dataset,   batch_size=config.batch_size, shuffle=False)
+                     
                         mlp_model, scaler, loss_history = train_mlp(
                             train_dataloader,
+                            val_dataloader,                       
                             config.n_ensembles,
                             loss_config=config.loss_config,
                             include_ensemble_spread=config.mlp_include_ensemble_spread,
-                            ensemble_percentiles = config.mlp_ensemble_percentiles,
-                            ensemble_selection_method = config.ensemble_selection_method,
-                            filter_ensemble = config.filter_ensemble,
-                            n_ensemble_keep = config.n_ensemble_keep,
+                            ensemble_percentiles=config.mlp_ensemble_percentiles,
+                            ensemble_selection_method=config.ensemble_selection_method,
+                            filter_ensemble=config.filter_ensemble,
+                            n_ensemble_keep=config.n_ensemble_keep,
                             architecture=config.mlp_architecture,
                             n_epochs=config.mlp_n_epochs,
                             learning_rate=config.mlp_learning_rate,
@@ -1579,8 +1545,6 @@ def run_training_pipeline(config: TrainingConfig):
                             patience=config.mlp_patience,
                             debug=False,
                         )
-                        
-                        # Single "regressor" loop for MLP
                         regressor_name = f"MLP_{'stats' if config.mlp_include_ensemble_spread else 'flat'}"
                         models_dict = {regressor_name: (mlp_model, scaler)}
                         
