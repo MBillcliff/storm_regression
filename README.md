@@ -2,11 +2,11 @@
 
 ## Introduction
 
-This repository provides the implementation of regression modelling for geomagnetic storm forecasting using solar wind ensembles. We target the Hpo indices themselves, rather than storm occurence, as done previously in Billcliff et al. (2025)
+This repository provides the implementation of regression modelling for geomagnetic storm forecasting using solar wind ensembles. We target the Hpo indices themselves, rather than storm occurence, as done previously in ['Billcliff et al. (2026)'](https://agupubs.onlinelibrary.wiley.com/doi/full/10.1029/2025SW004823)
 
 The work builds on utilities and preprocessing from [`storm_utils`](https://github.com/MBillcliff/storm_utils), and uses data generated via ambient HUXt ensemble simulations.
 
-Billcliff et al. (2025, in review)
+['Billcliff et al. (2026)'](https://agupubs.onlinelibrary.wiley.com/doi/full/10.1029/2025SW004823)
 
 ## Installation
 
