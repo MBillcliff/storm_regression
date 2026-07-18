@@ -133,9 +133,8 @@ def save_results(
     ]
 
     if hasattr(config, 'run_name') and config.run_name:
-        filename = f"results_{config.run_name}.pkl"
+        filename = f"results_{config.run_name}_seed{random_seed}_lt{lead_time}_fold{test_fold}.pkl"
     else:
-        # existing auto-generated filename logic
         filename = "_".join(filename_parts) + ".pkl"
 
     output_path = output_folder / filename
@@ -152,6 +151,7 @@ def save_results(
         'omni_subset': config.omni_subset,
         'remove_cmes': getattr(config, 'remove_cmes', False),
         'model_name': model_name,  # Full constructed name
+        'run_name': getattr(config, 'run_name', None),
         'constraint_method': constraint_method,
         'test_indices': test_indices.tolist() if isinstance(test_indices, np.ndarray) else test_indices,
     }

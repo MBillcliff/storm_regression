@@ -19,6 +19,9 @@ from storm_regression.results_io import load_results, recreate_dataset_from_resu
 from storm_regression.plotting import plot_comparative_case_study
 import pickle
 import logging
+import pickle
+import re
+
 
 # Configure logging
 logging.basicConfig(
@@ -405,6 +408,112 @@ def create_probabilistic_dashboard(results_path, family="auto",
 def _run_label(file, config):
     """The identifier that actually distinguishes runs."""
     return config.get('run_name') or Path(file).stem
+
+
+def _dataset_key(cfg, dsp):
+    """Config tuple that determines window_labels/max_targets/valid_indices."""
+    return (
+        str(dsp['huxt_data_path']),
+        str(dsp.get('discontinuity_path')),
+        cfg['lead_time'],
+        dsp['forecast_duration_hours'],
+        dsp['stride_hours'],
+        bool(cfg.get('remove_cmes', False)),
+        bool(cfg.get('balance', False)),
+    )
+
+
+def _run_label_from_stem(stem):
+    """Recover the human arm label from the filename (strip seed/lt/fold suffix)."""
+    s = re.sub(r'_seed\d+_lt\d+_fold\d+$', '', stem)
+    return s.replace('results_', '', 1)
+
+
+def fast_batch_metrics(results_dir, threshold=4.5, point_key='y_pred_lognormal_median',
+                       verify_alignment=True):
+    files = sorted(Path(results_dir).glob('*.pkl'))
+    if not files:
+        raise FileNotFoundError(f"No .pkl files in {results_dir}")
+
+    ds_cache = {}          # key -> dict(labels=, targets=, valid_indices=)
+    rows = []
+
+    for f in files:
+        with open(f, 'rb') as fh:
+            pkg = pickle.load(fh)
+        r, cfg, dsp = pkg['results'], pkg['config'], pkg['dataset_params']
+        key = _dataset_key(cfg, dsp)
+
+        # build ONCE per unique dataset-determining config
+        if key not in ds_cache:
+            print(f"Building dataset for key: lead={cfg['lead_time']}, "
+                  f"cmes={cfg.get('remove_cmes')}, balance={cfg.get('balance')} ...")
+            ds = recreate_dataset_from_results(f)
+            ds_cache[key] = {
+                'labels':  np.asarray(ds.window_labels),
+                'targets': np.asarray(ds.max_targets),
+                'valid_indices': list(ds.valid_indices),
+            }
+            del ds  # free the 600-column DataFrame immediately
+
+        cache = ds_cache[key]
+        test_idx = np.asarray(cfg['test_indices'])
+        labels_te  = cache['labels'][test_idx]
+        targets_te = cache['targets'][test_idx]
+
+        y = np.asarray(r['y_test']).ravel()
+
+        # ALIGNMENT GUARD: sliced targets must equal the stored y_test
+        if verify_alignment and not np.allclose(targets_te.astype(float), y, atol=1e-6):
+            raise AssertionError(
+                f"Alignment mismatch in {f.name}: cached targets[test_idx] != y_test. "
+                f"test_indices are not positions into this dataset's valid_indices "
+                f"(check lead/cme/balance match)."
+            )
+
+        fc = forecast_from_results(r, family='auto')
+        crps = np.asarray(fc.crps(y)).ravel()
+        pit  = np.asarray(fc.pit(y)).ravel()
+        yhat = np.asarray(r[point_key]).ravel()
+
+        subsets = {
+            'all':   np.ones_like(y, dtype=bool),
+            'storm': y > threshold,
+            'quiet': y <= threshold,
+            'ICME':  np.isin(labels_te, ['ICME_input', 'ICME_forecast']),
+            'SIR':   np.isin(labels_te, ['SIR_input', 'SIR_forecast']),
+        }
+        run_label = _run_label_from_stem(f.stem)
+        for name, mask in subsets.items():
+            if mask.sum() == 0:
+                continue
+            pit_ks = float(kstest(pit[mask], 'uniform').statistic) if mask.sum() > 5 else np.nan
+            rows.append({
+                'run': run_label, 'fold': cfg['test_fold'], 'seed': cfg['random_seed'],
+                'lead': cfg['lead_time'], 'subset': name, 'n': int(mask.sum()),
+                'crps': float(np.mean(crps[mask])),
+                'pit_ks': pit_ks,
+                'mean_pred':   float(np.mean(yhat[mask])),
+                'mean_target': float(np.mean(y[mask])),
+                'bias':        float(np.mean(yhat[mask] - y[mask])),
+                'rmse': float(np.sqrt(np.mean((yhat[mask] - y[mask])**2))),
+                'mae':  float(np.mean(np.abs(yhat[mask] - y[mask]))),
+            })
+
+    print(f"Built {len(ds_cache)} dataset(s) for {len(files)} files.")
+    return pd.DataFrame(rows)
+
+
+def aggregate_folds(df):
+    """Mean +/- std across folds, per run x subset (x lead if multiple)."""
+    grp = ['run', 'subset'] + (['lead'] if df['lead'].nunique() > 1 else [])
+    return (df.groupby(grp)
+              .agg(crps_mean=('crps','mean'), crps_std=('crps','std'),
+                 pit_ks_mean=('pit_ks','mean'), pit_ks_std=('pit_ks','std'),
+                 bias_mean=('bias','mean'), bias_std=('bias','std'),
+                 mean_pred_mean=('mean_pred','mean'),
+                 n_folds=('fold','nunique'))
+              .reset_index())
 
 
 def auto_detect_and_compare(
