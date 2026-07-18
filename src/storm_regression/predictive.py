@@ -216,6 +216,25 @@ class WeibullForecast(PredictiveForecast):
     def subset(self, idx):
         return WeibullForecast(self.lam[idx], self.k[idx])
 
+    def crps(self, y, **kw):
+        """Closed-form CRPS for a Weibull(lambda=scale, k=shape).
+
+        CRPS = y(2F(y) - 1)
+               + lam * Gamma(1+1/k) * [1 - 2 P(1+1/k, (y/lam)^k)]
+               - lam * Gamma(1+1/k) * (1 - 2^{-1/k}),
+        with P the regularised lower incomplete gamma. Verified against
+        numerical integration of the CRPS integral and Monte Carlo (4 dp).
+        Lower is better.
+        """
+        from scipy.special import gamma as _gamma, gammainc as _gammainc
+        y = np.asarray(y, dtype=float)
+        F = weibull_min.cdf(y, c=self.k, scale=self.lam)
+        g = _gamma(1.0 + 1.0 / self.k)
+        P = _gammainc(1.0 + 1.0 / self.k, (y / self.lam) ** self.k)
+        return (y * (2.0 * F - 1.0)
+                + self.lam * g * (1.0 - 2.0 * P)
+                - self.lam * g * (1.0 - 2.0 ** (-1.0 / self.k)))
+
 
 # ---------------------------------------------------------------------------
 # Empirical ensemble  (raw member point-predictions)

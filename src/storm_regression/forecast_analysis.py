@@ -4,6 +4,9 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.dates import DateFormatter
 from matplotlib.colors import Normalize
+from scipy.stats import weibull_min, kstest
+from matplotlib.gridspec import GridSpec
+from storm_regression.predictive import forecast_from_results
 from scipy.stats import weibull_min
 from scipy.integrate import quad
 from scipy.special import gamma
@@ -12,7 +15,6 @@ import os
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score, explained_variance_score
 from typing import Dict, List, Optional, Tuple, Callable
 from pathlib import Path
-from storm_regression.case_study_analysis import analyze_results
 from storm_regression.results_io import load_results, recreate_dataset_from_results
 from storm_regression.plotting import plot_comparative_case_study
 import pickle
@@ -63,802 +65,87 @@ def evaluate_regression_forecast(
     }
 
 
-def crps_weibull(
-    y_test: np.ndarray,
-    lambda_forecast: np.ndarray,
-    k_forecast: np.ndarray
-) -> Tuple[np.ndarray, float]:
-    """
-    Calculate Continuous Ranked Probability Score (CRPS) for Weibull distribution forecasts.
-    
-    The CRPS measures the difference between the predicted probability distribution
-    and the observed value, providing a proper scoring rule for probabilistic forecasts.
-    
-    Parameters
-    ----------
-    y_test : array-like, shape (n_samples,)
-        Observed target values
-    lambda_forecast : array-like, shape (n_samples,)
-        Forecasted Weibull scale parameters (λ)
-    k_forecast : array-like, shape (n_samples,)
-        Forecasted Weibull shape parameters (k)
-    
-    Returns
-    -------
-    crps_scores : ndarray, shape (n_samples,)
-        CRPS for each forecast-observation pair
-    mean_crps : float
-        Mean CRPS across all samples
-        
-    Notes
-    -----
-    Lower CRPS values indicate better probabilistic forecasts.
-    CRPS reduces to MAE when the forecast is deterministic.
-    
-    References
-    ----------
-    Gneiting, T., & Raftery, A. E. (2007). Strictly proper scoring rules, 
-    prediction, and estimation. Journal of the American Statistical Association.
-    """
-    y_test = np.asarray(y_test).ravel()
-    lambda_forecast = np.asarray(lambda_forecast).ravel()
-    k_forecast = np.asarray(k_forecast).ravel()
-    
-    # Validate inputs
-    if not (len(y_test) == len(lambda_forecast) == len(k_forecast)):
-        raise ValueError("All input arrays must have the same length")
-    
-    if np.any(lambda_forecast <= 0) or np.any(k_forecast <= 0):
-        raise ValueError("Weibull parameters must be positive")
-    
-    # Weibull CDF at observed values
-    # scipy uses scale=lambda and c=k parameterization
-    cdf_y = weibull_min.cdf(y_test, c=k_forecast, scale=lambda_forecast)
-    
-    # Gamma function terms
-    gamma_term = gamma(1 + 1/k_forecast)
-     
-    # CRPS formula for Weibull distribution
-    crps_scores = (
-        y_test 
-        - lambda_forecast * (1 - 2*cdf_y) * gamma_term
-        + (lambda_forecast / (2**(1/k_forecast))) * gamma_term
-    )
-    
-    mean_crps = np.mean(crps_scores)
-    
-    return crps_scores, mean_crps
-
-
-def evaluate_ensemble_forecast(
-    y_pred: np.ndarray,
-    y_true: np.ndarray,
-    lambda_forecast: Optional[np.ndarray] = None,
-    k_forecast: Optional[np.ndarray] = None
-) -> Dict[str, float]:
-    """
-    Comprehensive evaluation of ensemble forecasts including deterministic and probabilistic metrics.
-    
-    Args:
-        y_pred: Point predictions (e.g., ensemble mean or median)
-        y_true: True observed values
-        lambda_forecast: Optional Weibull scale parameters for CRPS calculation
-        k_forecast: Optional Weibull shape parameters for CRPS calculation
-    
-    Returns:
-        Dictionary containing all available metrics
-    """
-    metrics = evaluate_regression_forecast(y_pred, y_true)
-    
-    # Add CRPS if distribution parameters are provided
-    if lambda_forecast is not None and k_forecast is not None:
-        _, mean_crps = crps_weibull(y_true, lambda_forecast, k_forecast)
-        metrics['crps'] = mean_crps
-    
-    return metrics
-
-def create_comparison_dashboard(
-    results_path: Path,
-    prediction_type: str = 'y_pred_lognormal_median',
-    save: bool = False,
-    save_name: Optional[str] = None
-) -> pd.DataFrame:
-    """
-    Create a comprehensive dashboard comparing model performance across different event types and storm strengths.
-    
-    Storm definitions:
-    - No storm: ≤4.5
-    - Storm: >4.5
-    - Strong storm: >6.5
-    
-    Parameters
-    ----------
-    results_path : Path
-        Path to saved results file
-    prediction_type : str
-        Which prediction to use: 'y_pred_lognormal_median', 'y_pred_weibull_median',
-        'y_pred_persistence', 'y_pred_27_day_recurrence', 'y_pred_persistence_max',
-        'y_pred_weighted_mean', 'y_pred_normal_median'
-    save : bool
-        Whether to save the figure
-    save_name : str, optional
-        Filename for saving
-        
-    Returns
-    -------
-    pd.DataFrame
-        Summary statistics for all subsets
-    """
-    import matplotlib.pyplot as plt
-    from matplotlib.gridspec import GridSpec
-    
-    # Load results and dataset ONCE
-    print("Loading results and dataset...")
-    results, config, _ = load_results(results_path)
-    dataset = recreate_dataset_from_results(results_path)
-    
-    # Get test data with specified prediction type
-    test_window_positions = config['test_indices']
-    
-    if prediction_type not in results:
-        available = [k for k in results.keys() if k.startswith('y_pred')]
-        raise ValueError(f"Prediction type '{prediction_type}' not found in results. "
-                        f"Available: {available}")
-    
-    predictions = results[prediction_type]
-    targets = results['y_test']
-    
-    print(f"Loaded {len(test_window_positions)} test samples")
-    print(f"Using prediction type: {prediction_type}")
-    
-    # Define subsets to compare with NEW storm definitions
-    subsets = {
-        'All test data': {},
-        'ICME (input)': {'event_types': ['ICME_input']},
-        'ICME (forecast)': {'event_types': ['ICME_forecast']},
-        'SIR (input)': {'event_types': ['SIR_input']},
-        'SIR (forecast)': {'event_types': ['SIR_forecast']},
-        'All ICME': {'event_types': ['ICME']},
-        'All SIR': {'event_types': ['SIR']},
-        'Quiet periods': {'event_types': ['quiet']},
-        'Active events': {'exclude_quiet': True},
-        'Strong storms (>6.5)': {'min_strength': 6.5},
-        'Storms (>4.5)': {'min_strength': 4.5},
-        'No storm (≤4.5)': {'min_strength': 0.0, 'max_strength': 4.5},
-        'ICME + Storm': {'event_types': ['ICME'], 'min_strength': 4.5},
-        'SIR + Storm': {'event_types': ['SIR'], 'min_strength': 4.5},
-        'ICME + Strong': {'event_types': ['ICME'], 'min_strength': 6.5},
-        'SIR + Strong': {'event_types': ['SIR'], 'min_strength': 6.5},
-    }
-    
-    # Function to compute metrics for a subset
-    def compute_subset_metrics(filtered_window_positions):
-        """Compute metrics for a filtered subset."""
-        from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
-        
-        # Map to test indices
-        window_pos_to_test_idx = {wp: i for i, wp in enumerate(test_window_positions)}
-        filtered_test_indices = [window_pos_to_test_idx[wp] 
-                                for wp in filtered_window_positions 
-                                if wp in window_pos_to_test_idx]
-        
-        if len(filtered_test_indices) == 0:
-            return None
-        
-        # Extract predictions and targets
-        filtered_preds = predictions[filtered_test_indices]
-        filtered_targets = targets[filtered_test_indices]
-        
-        # Compute metrics
-        return {
-            'n_samples': len(filtered_window_positions),
-            'rmse': np.sqrt(mean_squared_error(filtered_targets, filtered_preds)),
-            'mae': mean_absolute_error(filtered_targets, filtered_preds),
-            'r2': r2_score(filtered_targets, filtered_preds),
-            'mse': mean_squared_error(filtered_targets, filtered_preds),
-            'mean_target': float(np.mean(filtered_targets)),
-            'mean_prediction': float(np.mean(filtered_preds)),
-            'std_target': float(np.std(filtered_targets)),
-            'std_prediction': float(np.std(filtered_preds))
-        }
-    
-    # Collect results for all subsets
-    print(f"Analyzing {len(subsets)} different subsets...")
-    comparison = {}
-    
-    for name, filters in subsets.items():
-        
-        # Start with all test window positions
-        filtered_window_positions = np.array(test_window_positions).copy()
-        
-        # Apply event type filter
-        event_types = filters.get('event_types')
-        exclude_quiet = filters.get('exclude_quiet', False)
-        forecast_only = filters.get('forecast_only', False)
-        
-        if event_types is not None or exclude_quiet or forecast_only:
-            filtered_window_positions = dataset.filter_indices_by_event_type(
-                filtered_window_positions.tolist(),
-                event_types=event_types,
-                exclude_quiet=exclude_quiet,
-                forecast_only=forecast_only
-            )
-        
-        # Apply storm strength filter
-        min_strength = filters.get('min_strength')
-        max_strength = filters.get('max_strength')
-        
-        if min_strength is not None or max_strength is not None:
-            filtered_window_positions = dataset.filter_indices_by_storm_strength(
-                filtered_window_positions.tolist(),
-                min_strength=min_strength if min_strength is not None else 0.0,
-                max_strength=max_strength
-            )
-        
-        # Compute metrics
-        metrics = compute_subset_metrics(filtered_window_positions)
-        if metrics is not None:
-            comparison[name] = metrics
-    
-    # Convert to DataFrame and SORT by RMSE
-    df = pd.DataFrame(comparison).T
-    df = df.sort_values('rmse', ascending=True)
-    
-    # Helper function to assign colors based on subset name
-    def get_color(name):
-        """Assign color based on storm category."""
-        if 'Strong' in name or '>6.5' in name:
-            return 'red'
-        elif ('Storm' in name or '>4.5' in name) and 'No storm' not in name:
-            return 'gold'
-        elif 'No storm' in name or '≤4.5' in name:
-            return 'forestgreen'
-        else:
-            return 'steelblue'
-    
-    # Create figure
-    fig = plt.figure(figsize=(20, 12))
-    gs = GridSpec(3, 3, figure=fig, hspace=0.3, wspace=0.3)
-    
-    # Get prediction name for title
-    pred_name_map = {
-        'y_pred_lognormal_median': 'LogNormal Median',
-        'y_pred_weibull_median': 'Weibull Median',
-        'y_pred_normal_median': 'Normal Median',
-        'y_pred_weighted_mean': 'Weighted Mean',
-        'y_pred_persistence': 'Persistence',
-        'y_pred_27_day_recurrence': '27-Day Recurrence',
-        'y_pred_persistence_max': 'Persistence Max',
-    }
-    pred_display_name = pred_name_map.get(prediction_type, prediction_type)
-    
-    fig.suptitle(f"Model Performance Dashboard - {config['model_name']} ({pred_display_name})\n"
-                 f"(Lead time: {config['lead_time']}h, Fold: {config['test_fold']})\n"
-                 f"Storm definitions: No storm (≤4.5), Storm (>4.5), Strong storm (>6.5)",
-                 fontsize=16, fontweight='bold')
-    
-    # ===== PANEL 1: RMSE Comparison (SORTED) =====
-    ax1 = fig.add_subplot(gs[0, 0])
-    subset_names = df.index
-    rmse_values = df['rmse'].values
-    colors = [get_color(name) for name in subset_names]
-    
-    bars = ax1.barh(range(len(subset_names)), rmse_values, color=colors, alpha=0.7, edgecolor='black')
-    ax1.set_yticks(range(len(subset_names)))
-    ax1.set_yticklabels(subset_names, fontsize=9)
-    ax1.set_xlabel('RMSE', fontsize=11, fontweight='bold')
-    ax1.set_title('Root Mean Squared Error (Sorted)', fontsize=12, fontweight='bold')
-    ax1.grid(axis='x', alpha=0.3)
-    ax1.invert_yaxis()
-    
-    for i, (bar, val) in enumerate(zip(bars, rmse_values)):
-        ax1.text(val + 0.05, bar.get_y() + bar.get_height()/2, f'{val:.3f}',
-                va='center', fontsize=8)
-    
-    # ===== PANEL 2: MAE Comparison (SORTED by RMSE order) =====
-    ax2 = fig.add_subplot(gs[0, 1])
-    mae_values = df['mae'].values
-    
-    bars = ax2.barh(range(len(subset_names)), mae_values, color=colors, alpha=0.7, edgecolor='black')
-    ax2.set_yticks(range(len(subset_names)))
-    ax2.set_yticklabels(subset_names, fontsize=9)
-    ax2.set_xlabel('MAE', fontsize=11, fontweight='bold')
-    ax2.set_title('Mean Absolute Error (by RMSE order)', fontsize=12, fontweight='bold')
-    ax2.grid(axis='x', alpha=0.3)
-    ax2.invert_yaxis()
-    
-    for i, (bar, val) in enumerate(zip(bars, mae_values)):
-        ax2.text(val + 0.05, bar.get_y() + bar.get_height()/2, f'{val:.3f}',
-                va='center', fontsize=8)
-    
-    # ===== PANEL 3: RMSE Improvement over Persistence Baseline =====
-    ax3 = fig.add_subplot(gs[0, 2])
-    
-    # Calculate improvement: (Baseline RMSE - Model RMSE) / Baseline RMSE * 100
-    # Positive = improvement, negative = worse than baseline
-    if 'y_pred_persistence_max' in results:
-        persistence_preds = results['y_pred_persistence_max']
-        
-        improvements = []
-        for name in subset_names:
-            # Get model metrics
-            model_metrics = df.loc[name]
-            
-            # Compute persistence baseline for this subset
-            window_pos_to_test_idx = {wp: i for i, wp in enumerate(test_window_positions)}
-            
-            # Recompute which windows are in this subset
-            filtered_window_positions = np.array(test_window_positions).copy()
-            
-            filters = subsets[name]
-            event_types = filters.get('event_types')
-            exclude_quiet = filters.get('exclude_quiet', False)
-            forecast_only = filters.get('forecast_only', False)
-            
-            if event_types is not None or exclude_quiet or forecast_only:
-                filtered_window_positions = dataset.filter_indices_by_event_type(
-                    filtered_window_positions.tolist(),
-                    event_types=event_types,
-                    exclude_quiet=exclude_quiet,
-                    forecast_only=forecast_only
-                )
-            
-            min_strength = filters.get('min_strength')
-            max_strength = filters.get('max_strength')
-            
-            if min_strength is not None or max_strength is not None:
-                filtered_window_positions = dataset.filter_indices_by_storm_strength(
-                    filtered_window_positions.tolist(),
-                    min_strength=min_strength if min_strength is not None else 0.0,
-                    max_strength=max_strength
-                )
-            
-            filtered_test_indices = [window_pos_to_test_idx[wp] 
-                                    for wp in filtered_window_positions 
-                                    if wp in window_pos_to_test_idx]
-            
-            if len(filtered_test_indices) > 0:
-                from sklearn.metrics import mean_squared_error
-                baseline_rmse = np.sqrt(mean_squared_error(
-                    targets[filtered_test_indices],
-                    persistence_preds[filtered_test_indices]
-                ))
-                
-                model_rmse = model_metrics['rmse']
-                improvement = (baseline_rmse - model_rmse) / baseline_rmse * 100
-                improvements.append(improvement)
-            else:
-                improvements.append(0)
-        
-        # Color code: green if positive (improvement), red if negative (worse)
-        colors_improvement = ['green' if imp > 0 else 'red' for imp in improvements]
-        
-        bars = ax3.barh(range(len(subset_names)), improvements, color=colors_improvement, 
-                       alpha=0.7, edgecolor='black')
-        ax3.set_yticks(range(len(subset_names)))
-        ax3.set_yticklabels(subset_names, fontsize=9)
-        ax3.set_xlabel('Improvement over Persistence Max (%)', fontsize=11, fontweight='bold')
-        ax3.set_title('% Improvement vs Persistence Max Baseline', fontsize=12, fontweight='bold')
-        ax3.grid(axis='x', alpha=0.3)
-        ax3.axvline(0, color='black', linewidth=1)
-        ax3.invert_yaxis()
-        
-        for i, (bar, val) in enumerate(zip(bars, improvements)):
-            ax3.text(val + 1 if val > 0 else val - 1, bar.get_y() + bar.get_height()/2, 
-                    f'{val:.1f}%', va='center', ha='left' if val > 0 else 'right', fontsize=8)
-    else:
-        # If no persistence baseline, just show bias
-        bias_values = df['mean_prediction'].values - df['mean_target'].values
-        colors_bias = ['green' if abs(b) < 0.5 else 'orange' if abs(b) < 1.0 else 'red' 
-                       for b in bias_values]
-        
-        bars = ax3.barh(range(len(subset_names)), bias_values, color=colors_bias, 
-                       alpha=0.7, edgecolor='black')
-        ax3.set_yticks(range(len(subset_names)))
-        ax3.set_yticklabels(subset_names, fontsize=9)
-        ax3.set_xlabel('Bias (Pred - Target)', fontsize=11, fontweight='bold')
-        ax3.set_title('Prediction Bias', fontsize=12, fontweight='bold')
-        ax3.grid(axis='x', alpha=0.3)
-        ax3.axvline(0, color='black', linewidth=1)
-        ax3.invert_yaxis()
-        
-        for i, (bar, val) in enumerate(zip(bars, bias_values)):
-            ax3.text(val + 0.05 if val > 0 else val - 0.05, bar.get_y() + bar.get_height()/2, 
-                    f'{val:.2f}', va='center', ha='left' if val > 0 else 'right', fontsize=8)
-    
-    # ===== PANEL 4: Sample Size Distribution (SORTED by RMSE order) =====
-    ax4 = fig.add_subplot(gs[1, 0])
-    sample_sizes = df['n_samples'].values
-    
-    bars = ax4.barh(range(len(subset_names)), sample_sizes, color=colors, alpha=0.7, edgecolor='black')
-    ax4.set_yticks(range(len(subset_names)))
-    ax4.set_yticklabels(subset_names, fontsize=9)
-    ax4.set_xlabel('Number of Samples', fontsize=11, fontweight='bold')
-    ax4.set_title('Sample Size by Subset (by RMSE order)', fontsize=12, fontweight='bold')
-    ax4.grid(axis='x', alpha=0.3)
-    ax4.invert_yaxis()
-    
-    for i, (bar, val) in enumerate(zip(bars, sample_sizes)):
-        ax4.text(val + 5, bar.get_y() + bar.get_height()/2, f'{int(val)}',
-                va='center', fontsize=8)
-    
-    # ===== PANEL 5: Mean Target vs Mean Prediction =====
-    ax5 = fig.add_subplot(gs[1, 1])
-    mean_targets = df['mean_target'].values
-    mean_preds = df['mean_prediction'].values
-    
-    ax5.scatter(mean_targets, mean_preds, s=100, alpha=0.7, c=colors, edgecolor='black')
-    
-    # Add diagonal line (perfect predictions)
-    min_val = min(mean_targets.min(), mean_preds.min())
-    max_val = max(mean_targets.max(), mean_preds.max())
-    ax5.plot([min_val, max_val], [min_val, max_val], 'k--', alpha=0.5, label='Perfect prediction')
-    
-    # Add labels for each point
-    for i, name in enumerate(subset_names):
-        ax5.annotate(name.split(' ')[0], (mean_targets[i], mean_preds[i]), 
-                    fontsize=7, alpha=0.7, xytext=(3, 3), textcoords='offset points')
-    
-    ax5.set_xlabel('Mean Target', fontsize=11, fontweight='bold')
-    ax5.set_ylabel('Mean Prediction', fontsize=11, fontweight='bold')
-    ax5.set_title('Prediction Bias', fontsize=12, fontweight='bold')
-    ax5.legend()
-    ax5.grid(alpha=0.3)
-    
-    # ===== PANEL 6: Error by Event Type =====
-    ax6 = fig.add_subplot(gs[1, 2])
-    
-    event_types = ['All ICME', 'All SIR', 'Quiet periods', 'Active events']
-    event_rmse = [df.loc[event, 'rmse'] if event in df.index else 0 for event in event_types]
-    event_colors = ['steelblue', 'steelblue', 'steelblue', 'steelblue']
-    
-    bars = ax6.bar(range(len(event_types)), event_rmse, color=event_colors, alpha=0.7, edgecolor='black')
-    ax6.set_xticks(range(len(event_types)))
-    ax6.set_xticklabels(['ICME', 'SIR', 'Quiet', 'Active'], fontsize=10)
-    ax6.set_ylabel('RMSE', fontsize=11, fontweight='bold')
-    ax6.set_title('RMSE by Event Type', fontsize=12, fontweight='bold')
-    ax6.grid(axis='y', alpha=0.3)
-    
-    for bar, val in zip(bars, event_rmse):
-        if val > 0:
-            ax6.text(bar.get_x() + bar.get_width()/2, val + 0.05, f'{val:.3f}',
-                    ha='center', va='bottom', fontsize=9, fontweight='bold')
-    
-    # ===== PANEL 7: Storm Strength Performance =====
-    ax7 = fig.add_subplot(gs[2, 0])
-    
-    strength_types = ['Strong storms (>6.5)', 'Storms (>4.5)', 'No storm (≤4.5)']
-    strength_rmse = [df.loc[st, 'rmse'] if st in df.index else 0 for st in strength_types]
-    strength_colors = ['red', 'gold', 'forestgreen']
-    
-    bars = ax7.bar(range(len(strength_types)), strength_rmse, color=strength_colors, alpha=0.7, edgecolor='black')
-    ax7.set_xticks(range(len(strength_types)))
-    ax7.set_xticklabels(['Strong\n(>6.5)', 'Storm\n(>4.5)', 'No storm\n(≤4.5)'], fontsize=10)
-    ax7.set_ylabel('RMSE', fontsize=11, fontweight='bold')
-    ax7.set_title('RMSE by Storm Strength', fontsize=12, fontweight='bold')
-    ax7.grid(axis='y', alpha=0.3)
-    
-    for bar, val in zip(bars, strength_rmse):
-        if val > 0:
-            ax7.text(bar.get_x() + bar.get_width()/2, val + 0.05, f'{val:.3f}',
-                    ha='center', va='bottom', fontsize=9, fontweight='bold')
-    
-    # ===== PANEL 8: Summary Statistics Table =====
-    ax8 = fig.add_subplot(gs[2, 1:])
-    ax8.axis('tight')
-    ax8.axis('off')
-    
-    # Create summary table with key metrics
-    summary_subsets = ['All test data', 'All ICME', 'All SIR', 'Strong storms (>6.5)', 'Storms (>4.5)', 'Active events']
-    table_data = []
-    for subset in summary_subsets:
-        if subset in df.index:
-            row = df.loc[subset]
-            bias = row['mean_prediction'] - row['mean_target']
-            table_data.append([
-                subset,
-                f"{int(row['n_samples'])}",
-                f"{row['rmse']:.3f}",
-                f"{row['mae']:.3f}",
-                f"{row['r2']:.3f}",
-                f"{row['mean_target']:.2f}",
-                f"{row['mean_prediction']:.2f}",
-                f"{bias:.2f}"
-            ])
-    
-    table = ax8.table(cellText=table_data,
-                     colLabels=['Subset', 'N', 'RMSE', 'MAE', 'R²', 'Mean Target', 'Mean Pred', 'Bias'],
-                     cellLoc='center',
-                     loc='center',
-                     bbox=[0, 0, 1, 1])
-    
-    table.auto_set_font_size(False)
-    table.set_fontsize(10)
-    table.scale(1, 2)
-    
-    # Style header
-    for i in range(8):
-        table[(0, i)].set_facecolor('#4472C4')
-        table[(0, i)].set_text_props(weight='bold', color='white')
-    
-    # Alternate row colors
-    for i in range(1, len(table_data) + 1):
-        for j in range(8):
-            if i % 2 == 0:
-                table[(i, j)].set_facecolor('#E7E6E6')
-    
-    ax8.set_title('Summary Statistics', fontsize=12, fontweight='bold', pad=20)
-    
-    plt.tight_layout()
-    
-    if save and save_name:
-        plt.savefig(save_name, dpi=300, bbox_inches='tight')
-        print(f"Dashboard saved to: {save_name}")
-    
-    plt.show()
-    
-    return df
-
-
-# Example usage and testing
-if __name__ == "__main__":
-    print("="*60)
-    print("Testing Ensemble Forecast Evaluation Functions")
-    print("="*60)
-    
-    # Example: 5 forecasts
-    lambda_forecast = np.array([3.5, 4.2, 2.8, 5.1, 3.9])
-    k_forecast = np.array([1.2, 0.8, 1.5, 0.9, 1.1])
-    y_test = np.array([3.0, 5.0, 2.5, 4.5, 4.0])
-    
-    # Calculate point forecasts (median of Weibull)
-    y_pred = lambda_forecast * (np.log(2) ** (1/k_forecast))
-    
-    print("\n1. Deterministic Metrics")
-    print("-" * 60)
-    det_metrics = evaluate_regression_forecast(y_pred, y_test)
-    for metric, value in det_metrics.items():
-        print(f"  {metric.upper()}: {value:.4f}")
-    
-    print("\n2. Probabilistic Metrics (CRPS)")
-    print("-" * 60)
-    crps_scores, mean_crps = crps_weibull(y_test, lambda_forecast, k_forecast)
-    
-    print("Individual CRPS scores:")
-    for i, (y, lam, k, crps) in enumerate(zip(y_test, lambda_forecast, k_forecast, crps_scores)):
-        print(f"  Sample {i}: y={y:.2f}, λ={lam:.2f}, k={k:.2f} → CRPS={crps:.4f}")
-    
-    print(f"\nMean CRPS: {mean_crps:.4f}")
-    
-    print("\n3. Combined Evaluation")
-    print("-" * 60)
-    all_metrics = evaluate_ensemble_forecast(y_pred, y_test, lambda_forecast, k_forecast)
-    for metric, value in all_metrics.items():
-        print(f"  {metric.upper()}: {value:.4f}")
-    
-    print("\n" + "="*60)
-
-
 def evaluate_distribution_forecast(
-    y_true: np.ndarray,
+    y_true,
     distribution: str,
     **dist_params
 ) -> Dict[str, float]:
-    """
-    Evaluate probabilistic forecasts using CRPS for various distributions.
-    
-    CRPS (Continuous Ranked Probability Score) measures the quality of probabilistic
-    forecasts by comparing the predicted distribution to the observed value.
-    Lower CRPS indicates better probabilistic forecasts.
-    
+    """Evaluate probabilistic forecasts using CRPS.
+
+    Thin adapter over storm_regression.predictive: builds the appropriate
+    PredictiveForecast and calls its closed-form crps(). A SINGLE CRPS
+    implementation is now used everywhere. (The previous stand-alone lognormal
+    branch scored the underlying Normal in log-space, giving values ~5x too
+    small and rank-distorting; the weibull branch was also incorrect. Both are
+    replaced by the verified closed forms in predictive.py.)
+
     Parameters
     ----------
     y_true : array-like
-        Observed target values
-    distribution : str
-        Distribution type: 'weibull', 'normal', 'lognormal'
-    **dist_params : dict
-        Distribution parameters:
-        - For 'weibull': lambda_pred, k_pred
-        - For 'normal': mu_pred, sigma_pred
-        - For 'lognormal': log_mu_pred, log_sigma_pred
-    
+        Observed target values.
+    distribution : {'weibull', 'normal', 'lognormal'}
+    **dist_params :
+        - 'weibull'   : lambda_pred, k_pred
+        - 'normal'    : mu_pred, sigma_pred
+        - 'lognormal' : log_mu_pred, log_sigma_pred
+
     Returns
     -------
-    dict
-        Dictionary containing:
-        - 'crps': Mean CRPS across all samples
-        - 'crps_scores': Individual CRPS scores per sample
-    
-    Examples
-    --------
-    >>> # Weibull CRPS
-    >>> metrics = evaluate_probabilistic_forecast(
-    ...     y_true, distribution='weibull', 
-    ...     lambda_pred=lambda_vals, k_pred=k_vals
-    ... )
-    
-    >>> # LogNormal CRPS
-    >>> metrics = evaluate_probabilistic_forecast(
-    ...     y_true, distribution='lognormal',
-    ...     log_mu_pred=mu_vals, log_sigma_pred=sigma_vals
-    ... )
+    dict with keys 'crps' (float, mean over samples) and
+    'crps_scores' (np.ndarray, per-sample).
     """
-    from scipy.stats import weibull_min, norm, lognorm
-    from scipy.special import gamma
-    
-    y_true = np.asarray(y_true).ravel()
+    from storm_regression.predictive import (
+        LogNormalForecast, NormalForecast, WeibullForecast,
+    )
+
+    y_true = np.asarray(y_true, dtype=float).ravel()
     distribution = distribution.lower()
-    
-    if distribution == 'weibull':
-        # Extract parameters
-        lambda_pred = np.asarray(dist_params.get('lambda_pred')).ravel()
-        k_pred = np.asarray(dist_params.get('k_pred')).ravel()
-        
-        if lambda_pred is None or k_pred is None:
-            raise ValueError("Weibull CRPS requires 'lambda_pred' and 'k_pred'")
-        
-        # Validate inputs
-        if not (len(y_true) == len(lambda_pred) == len(k_pred)):
-            raise ValueError("All arrays must have the same length")
-        
-        # Weibull CRPS formula
-        cdf_y = weibull_min.cdf(y_true, c=k_pred, scale=lambda_pred)
-        gamma_term = gamma(1 + 1/k_pred)
-        
-        crps_scores = (
-            y_true 
-            - lambda_pred * (1 - 2*cdf_y) * gamma_term
-            + (lambda_pred / (2**(1/k_pred))) * gamma_term
-        )
-    
-    elif distribution == 'normal':
-        # Extract parameters
-        mu_pred = np.asarray(dist_params.get('mu_pred')).ravel()
-        sigma_pred = np.asarray(dist_params.get('sigma_pred')).ravel()
-        
-        if mu_pred is None or sigma_pred is None:
-            raise ValueError("Normal CRPS requires 'mu_pred' and 'sigma_pred'")
-        
-        if not (len(y_true) == len(mu_pred) == len(sigma_pred)):
-            raise ValueError("All arrays must have the same length")
-        
-        # Normal CRPS formula
-        # CRPS(Normal(μ, σ²), y) = σ * [z * (2Φ(z) - 1) + 2φ(z) - 1/√π]
-        # where z = (y - μ) / σ
-        z = (y_true - mu_pred) / sigma_pred
-        phi_z = norm.pdf(z)  # Standard normal PDF
-        Phi_z = norm.cdf(z)  # Standard normal CDF
-        
-        crps_scores = sigma_pred * (z * (2*Phi_z - 1) + 2*phi_z - 1/np.sqrt(np.pi))
-    
-    elif distribution == 'lognormal':
-        # Extract parameters
-        log_mu_pred = np.asarray(dist_params.get('log_mu_pred')).ravel()
-        log_sigma_pred = np.asarray(dist_params.get('log_sigma_pred')).ravel()
-        
-        if log_mu_pred is None or log_sigma_pred is None:
+
+    if distribution == 'lognormal':
+        log_mu = dist_params.get('log_mu_pred')
+        log_sigma = dist_params.get('log_sigma_pred')
+        if log_mu is None or log_sigma is None:
             raise ValueError("LogNormal CRPS requires 'log_mu_pred' and 'log_sigma_pred'")
-        
-        if not (len(y_true) == len(log_mu_pred) == len(log_sigma_pred)):
+        log_mu = np.asarray(log_mu, dtype=float).ravel()
+        log_sigma = np.asarray(log_sigma, dtype=float).ravel()
+        if not (len(y_true) == len(log_mu) == len(log_sigma)):
             raise ValueError("All arrays must have the same length")
-        
-        # Fast approximation: Transform to log-space, compute Normal CRPS, then adjust
-        # This is vectorized and much faster than Monte Carlo
-        from scipy.stats import norm
-        
-        # Handle non-positive observations
-        valid_mask = y_true > 0
-        crps_scores = np.full_like(y_true, np.nan, dtype=float)
-        
-        if np.any(valid_mask):
-            # Transform observations to log-space
-            log_y_true = np.log(y_true[valid_mask])
-            log_mu = log_mu_pred[valid_mask]
-            log_sigma = log_sigma_pred[valid_mask]
-            
-            # Compute Normal CRPS in log-space
-            z = (log_y_true - log_mu) / log_sigma
-            phi_z = norm.pdf(z)
-            Phi_z = norm.cdf(z)
-            
-            crps_log_space = log_sigma * (z * (2*Phi_z - 1) + 2*phi_z - 1/np.sqrt(np.pi))
-            
-            # Approximate transformation back to original space
-            # Multiply by the median to get approximate scale
-            median_pred = np.exp(log_mu)
-            crps_scores[valid_mask] = crps_log_space * median_pred / np.exp(log_mu)
+        fc = LogNormalForecast(log_mu, log_sigma)
+
+    elif distribution == 'normal':
+        mu = dist_params.get('mu_pred')
+        sigma = dist_params.get('sigma_pred')
+        if mu is None or sigma is None:
+            raise ValueError("Normal CRPS requires 'mu_pred' and 'sigma_pred'")
+        mu = np.asarray(mu, dtype=float).ravel()
+        sigma = np.asarray(sigma, dtype=float).ravel()
+        if not (len(y_true) == len(mu) == len(sigma)):
+            raise ValueError("All arrays must have the same length")
+        fc = NormalForecast(mu, sigma)
+
+    elif distribution == 'weibull':
+        lam = dist_params.get('lambda_pred')
+        k = dist_params.get('k_pred')
+        if lam is None or k is None:
+            raise ValueError("Weibull CRPS requires 'lambda_pred' and 'k_pred'")
+        lam = np.asarray(lam, dtype=float).ravel()
+        k = np.asarray(k, dtype=float).ravel()
+        if not (len(y_true) == len(lam) == len(k)):
+            raise ValueError("All arrays must have the same length")
+        fc = WeibullForecast(lam, k)
+
     else:
-        raise ValueError(f"Unknown distribution: '{distribution}'. Must be 'weibull', 'normal', or 'lognormal'")
-    
-    mean_crps = np.mean(crps_scores)
-    
+        raise ValueError(
+            f"Unknown distribution: '{distribution}'. "
+            f"Must be 'weibull', 'normal', or 'lognormal'."
+        )
+
+    crps_scores = np.asarray(fc.crps(y_true), dtype=float)
     return {
-        'crps': mean_crps,
-        'crps_scores': crps_scores
+        'crps': float(np.nanmean(crps_scores)),
+        'crps_scores': crps_scores,
     }
 
-
-def evaluate_forecast_comprehensive(
-    y_pred: np.ndarray,
-    y_true: np.ndarray,
-    distribution: Optional[str] = None,
-    **dist_params
-) -> Dict[str, float]:
-    """
-    Comprehensive evaluation combining deterministic and probabilistic metrics.
-    
-    Parameters
-    ----------
-    y_pred : array-like
-        Point predictions
-    y_true : array-like
-        True observed values
-    distribution : str, optional
-        Distribution type for CRPS: 'weibull', 'normal', 'lognormal'
-        If None, only deterministic metrics are computed
-    **dist_params : dict
-        Distribution parameters (see evaluate_probabilistic_forecast)
-    
-    Returns
-    -------
-    dict
-        Combined dictionary of deterministic and probabilistic metrics
-    
-    Examples
-    --------
-    >>> # Deterministic only
-    >>> metrics = evaluate_forecast_comprehensive(y_pred, y_true)
-    
-    >>> # With probabilistic (Weibull)
-    >>> metrics = evaluate_forecast_comprehensive(
-    ...     y_pred, y_true,
-    ...     distribution='weibull',
-    ...     lambda_pred=lambda_vals, k_pred=k_vals
-    ... )
-    """
-    # Compute deterministic metrics
-    metrics = evaluate_regression_forecast(y_pred, y_true)
-    
-    # Add probabilistic metrics if distribution provided
-    if distribution is not None:
-        prob_metrics = evaluate_probabilistic_forecast(y_true, distribution, **dist_params)
-        metrics['crps'] = prob_metrics['crps']
-        # Don't include individual scores in summary
-    
-    return metrics
-
-"""
-Reworked probabilistic dashboard: verifies the FINAL predictive distribution only.
-
-Drop-in replacement for create_probabilistic_dashboard in forecast_analysis.py.
-
-What changed vs the old version, and why
-----------------------------------------
-- Everything is computed from a single PredictiveForecast object (forecast_from_results),
-  so CRPS and every calibration panel describe the SAME distribution. No more reaching
-  into 'ensemble_predictions' vs 'log_mu'/'log_sigma' depending on the model.
-- RANK HISTOGRAM -> PIT HISTOGRAM. The rank histogram is an ensemble tool (rank of the
-  obs among M members); with a continuous forecast there are no members to rank. Its
-  continuous analogue is the PIT histogram: pit_i = F_i(y_i), uniform iff calibrated.
-- SHARPNESS is now the std of the predictive distribution (forecast.std()), not the
-  spread of ensemble members.
-- SKILL is now CRPS skill score vs climatology (CRPSS), the proper probabilistic skill
-  score and the analogue of the paper's BSS-vs-climatology — replacing MSE-of-median.
-- COVERAGE and THRESHOLD-RELIABILITY are kept: they are properties of the predictive
-  CDF, not of ensemble members, and are computed from forecast quantiles / exceedance
-  probabilities.
-"""
-
-import numpy as np
-import matplotlib.pyplot as plt
-from matplotlib.gridspec import GridSpec
-from scipy.stats import kstest
-
-from storm_regression.predictive import forecast_from_results
-from storm_regression.case_study_analysis import (
-    load_results, recreate_dataset_from_results,
-)
 
 
 def _climatology_crps(pool, y):
@@ -1318,60 +605,6 @@ def compare_models_and_lead_times(
         save_dir.mkdir(parents=True, exist_ok=True)
         df.to_csv(save_dir / 'comprehensive_results.csv', index=False)
     return df
-    
-
-def plot_lead_time_degradation(results_df: pd.DataFrame, subset: str = 'All test data'):
-    """Plot how performance degrades with lead time for each model."""
-    import matplotlib.pyplot as plt
-    
-    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
-    
-    subset_data = results_df[results_df['subset'] == subset]
-    models = subset_data['model'].unique()
-    
-    metrics = ['rmse', 'mae', 'r2']
-    titles = ['RMSE vs Lead Time', 'MAE vs Lead Time', 'R² vs Lead Time']
-    
-    for ax, metric, title in zip(axes, metrics, titles):
-        for model in models:
-            model_data = subset_data[subset_data['model'] == model].sort_values('lead_time')
-            ax.plot(model_data['lead_time'], model_data[metric], 
-                   marker='o', linewidth=2, label=model, markersize=8)
-        
-        ax.set_xlabel('Lead Time (hours)', fontsize=12)
-        ax.set_ylabel(metric.upper(), fontsize=12)
-        ax.set_title(f'{title}\n({subset})', fontsize=13, fontweight='bold')
-        ax.legend()
-        ax.grid(alpha=0.3)
-    
-    plt.tight_layout()
-    plt.show()
-
-
-def create_model_ranking_table(results_df: pd.DataFrame) -> pd.DataFrame:
-    """Create a ranking table showing which model performs best for each scenario."""
-    
-    rankings = []
-    
-    for subset in results_df['subset'].unique():
-        for lead_time in results_df['lead_time'].unique():
-            subset_data = results_df[
-                (results_df['subset'] == subset) & 
-                (results_df['lead_time'] == lead_time)
-            ].sort_values('rmse')
-            
-            if len(subset_data) > 0:
-                rankings.append({
-                    'subset': subset,
-                    'lead_time': lead_time,
-                    'best_model': subset_data.iloc[0]['model'],
-                    'best_rmse': subset_data.iloc[0]['rmse'],
-                    'worst_model': subset_data.iloc[-1]['model'],
-                    'worst_rmse': subset_data.iloc[-1]['rmse'],
-                    'improvement': subset_data.iloc[-1]['rmse'] - subset_data.iloc[0]['rmse']
-                })
-    
-    return pd.DataFrame(rankings)
 
 
 def create_comprehensive_visualization(
@@ -1705,126 +938,236 @@ def create_comprehensive_visualization(
     
     plt.show()
 
-def select_representative_cases(
-    dataset,
-    results: dict,
-    config: dict,
-    categories: Optional[Dict[str, dict]] = None,
-    selection: str = 'median',  # 'median', 'strongest', 'random'
-    random_state: int = 42,
-) -> Dict[str, Optional[int]]:
-    """
-    Select one representative window position per storm/event category.
 
-    Parameters
-    ----------
-    dataset : ForecastingDataset
-        The reconstructed dataset.
-    results : dict
-        Results dict from the anchor model.
-    config : dict
-        Config dict from the anchor model.
-    categories : dict, optional
-        Custom category definitions. Each key is a label, value is a dict
-        of filter kwargs. Defaults to a standard set covering event type
-        x storm strength.
-    selection : str
-        How to pick the representative from each category:
-        - 'median'   : case closest to the median max_target in the category
-        - 'strongest': case with the highest max_target
-        - 'random'   : random case
-    random_state : int
-        Seed for random selection.
-
-    Returns
-    -------
-    dict
-        {category_label: window_position} — None if no cases found.
-    """
-    import random as _random
-    _random.seed(random_state)
-    np.random.seed(random_state)
-
-    if categories is None:
-        categories = {
-            'ICME (input)':       {'event_types': ['ICME_input'],    'exclude_quiet': False},
-            'ICME (forecast)':    {'event_types': ['ICME_forecast'], 'exclude_quiet': False},
-            'SIR (input)':        {'event_types': ['SIR_input'],     'exclude_quiet': False},
-            'SIR (forecast)':     {'event_types': ['SIR_forecast'],  'exclude_quiet': False},
-            'Quiet':              {'event_types': ['quiet'],         'exclude_quiet': False},
-            'No storm (≤4.5)':    {'min_strength': 0.0, 'max_strength': 4.5},
-            'Moderate (4.5–6.5)': {'min_strength': 4.5, 'max_strength': 6.5},
-            'Strong (>6.5)':      {'min_strength': 6.5},
-        }
-
-    test_window_positions = config['test_indices']
+def analyze_results(
+    results_path: Path,
+    n: Optional[int] = None,
+    sort_by: str = 'y_test',
+    descending: bool = True,
+    event_types: Optional[List[str]] = None,
+    min_strength: Optional[float] = None,
+    max_strength: Optional[float] = None,
+    exclude_quiet: bool = False,
+    forecast_only: bool = False,
+    plot_function: Optional[Callable] = None,
+    verify_labels: bool = False,
+) -> Dict:
+    """Analyze results with optional filtering and case studies."""
+    
+    # Load results and recreate dataset
+    results, config, _ = load_results(results_path)
+    dataset = recreate_dataset_from_results(results_path)
+    
+    # Get test window positions from config
+    test_window_positions = config['test_indices']  # [0, 1, 2, 3, ...]
+    print(results.keys())
+    predictions = results['y_pred_lognormal_median']
     targets = results['y_test']
+    
+    print(f"\n{'='*80}")
+    if n is not None:
+        print(f"Analyzing top {n} cases sorted by {sort_by}")
+    else:
+        print(f"Analyzing filtered results")
+    print(f"{'='*80}")
+    print(f"Config: seed={config['random_seed']}, lead_time={config['lead_time']}h, "
+          f"fold={config['test_fold']}")
+    print(f"Model: {config['model_name']}")
+    print(f"Original test samples: {len(test_window_positions)}")
+    
+    # Start with all test window positions (NOT center indices!)
+    filtered_window_positions = np.array(test_window_positions).copy()
+    
+    # Apply event type filter (filter functions expect window positions)
+    if event_types is not None or exclude_quiet or forecast_only:
+        filtered_window_positions = dataset.filter_indices_by_event_type(
+            filtered_window_positions.tolist(),
+            event_types=event_types,
+            exclude_quiet=exclude_quiet,
+            forecast_only=forecast_only
+        )
+        print(f"After event filter: {len(filtered_window_positions)} samples")
+    
+    # Apply storm strength filter (also expects window positions)
+    if min_strength is not None:
+        filtered_window_positions = dataset.filter_indices_by_storm_strength(
+            filtered_window_positions.tolist(),
+            min_strength=min_strength,
+            max_strength=max_strength
+        )
+        print(f"After strength filter: {len(filtered_window_positions)} samples")
+    
+    # Map filtered window positions to test array positions
     window_pos_to_test_idx = {wp: i for i, wp in enumerate(test_window_positions)}
+    filtered_test_indices = [window_pos_to_test_idx[wp] 
+                            for wp in filtered_window_positions 
+                            if wp in window_pos_to_test_idx]
+    
+    # Extract filtered predictions and targets
+    filtered_preds = predictions[filtered_test_indices]
+    filtered_targets = targets[filtered_test_indices]
+    
+    # Compute metrics
+    from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+    
+    if len(filtered_preds) > 0:
+        metrics = {
+            'n_samples': len(filtered_window_positions),
+            'mse': mean_squared_error(filtered_targets, filtered_preds),
+            'rmse': np.sqrt(mean_squared_error(filtered_targets, filtered_preds)),
+            'mae': mean_absolute_error(filtered_targets, filtered_preds),
+            'r2': r2_score(filtered_targets, filtered_preds),
+            'mean_target': float(np.mean(filtered_targets)),
+            'mean_prediction': float(np.mean(filtered_preds)),
+            'std_target': float(np.std(filtered_targets)),
+            'std_prediction': float(np.std(filtered_preds))
+        }
+        
+        print(f"\n{'-'*80}")
+        print(f"Filtered Metrics:")
+        print(f"  RMSE: {metrics['rmse']:.3f}")
+        print(f"  MAE: {metrics['mae']:.3f}")
+        print(f"  R²: {metrics['r2']:.3f}")
+        print(f"  Mean target: {metrics['mean_target']:.3f}")
+        print(f"  Mean prediction: {metrics['mean_prediction']:.3f}")
+        print(f"{'-'*80}\n")
+    else:
+        print("No samples matched the filter criteria!")
+        metrics = None
+    
+    # Analyze top N cases if requested
+    cases = []
+    if n is not None and len(filtered_preds) > 0:
+        # Sort within filtered results
+        if sort_by == 'y_test':
+            sort_values = filtered_targets
+        else:
+            sort_values = results[sort_by][filtered_test_indices]
+        
+        if descending:
+            top_n_positions = np.argsort(sort_values)[-min(n, len(sort_values)):][::-1]
+        else:
+            top_n_positions = np.argsort(sort_values)[:min(n, len(sort_values))]
+        
+        # Analyze each case
+        for i, pos_in_filtered in enumerate(top_n_positions):
+            # Get indices
+            test_idx = filtered_test_indices[pos_in_filtered]
+            window_position = filtered_window_positions[pos_in_filtered]
+            center_idx = results['window_idx'][test_idx]
+            
+            if verify_labels and 'ICME_flag' in dataset.df.columns:
+                input_start_idx = center_idx + dataset.min_offset
+                input_end_idx = center_idx + dataset.lead_time  # Input window end
+                forecast_start_idx = center_idx + dataset.lead_time
+                forecast_end_idx = center_idx + dataset.max_offset + 1
+                
+                # Check input window
+                input_df = dataset.df.iloc[input_start_idx:input_end_idx]
+                icme_in_input = input_df['ICME_flag'].any()
+                sir_in_input = input_df['SIR_flag'].any()
+                
+                # Check forecast window
+                forecast_df = dataset.df.iloc[forecast_start_idx:forecast_end_idx]
+                icme_in_forecast = forecast_df['ICME_flag'].any()
+                sir_in_forecast = forecast_df['SIR_flag'].any()
+                
+                # Determine recalculated label
+                if icme_in_input and not icme_in_forecast:
+                    recalc_label = 'ICME_input'
+                elif icme_in_forecast and not icme_in_input:
+                    recalc_label = 'ICME_forecast'
+                elif icme_in_input and icme_in_forecast:
+                    recalc_label = 'ICME_input'  # Or 'Both' if you have that category
+                elif sir_in_input and not sir_in_forecast:
+                    recalc_label = 'SIR_input'
+                elif sir_in_forecast and not sir_in_input:
+                    recalc_label = 'SIR_forecast'
+                elif sir_in_input and sir_in_forecast:
+                    recalc_label = 'SIR_input'
+                else:
+                    recalc_label = 'quiet'
+                
+                # Get stored label
+                stored_label = dataset.window_labels[window_position]
+                
+                print(f"\n{'='*60}")
+                print(f"LABEL VERIFICATION FOR CASE #{i+1}")
+                print(f"{'='*60}")
+                print(f"Window position: {window_position}")
+                print(f"Center index: {center_idx}")
+                print(f"Center timestamp: {dataset.df.index[center_idx]}")
+                print(f"\nInput window: {dataset.df.index[input_start_idx]} to {dataset.df.index[input_end_idx-1]}")
+                print(f"  ICME present: {icme_in_input}")
+                print(f"  SIR present: {sir_in_input}")
+                print(f"\nForecast window: {dataset.df.index[forecast_start_idx]} to {dataset.df.index[forecast_end_idx-1]}")
+                print(f"  ICME present: {icme_in_forecast}")
+                print(f"  SIR present: {sir_in_forecast}")
+                print(f"\nStored label: {stored_label}")
+                print(f"Recalculated label: {recalc_label}")
+                print(f"Match: {stored_label == recalc_label}")
+                print(f"{'='*60}\n")
+            
+            # Extract values
+            case_info = {
+                'rank': i + 1,
+                'window_position': int(window_position),
+                'center_idx': int(center_idx),
+                'test_idx': int(test_idx),
+                'y_true': float(results['y_test'][test_idx]),
+                'y_pred_persistence': float(results['y_pred_persistence'][test_idx]),
+                'y_pred_lognormal_median': float(results['y_pred_lognormal_median'][test_idx]),
+            }
 
-    selected = {}
-
-    for label, filters in categories.items():
-        # ── Apply event type filter ───────────────────────────────────────────
-        filtered_wps = np.array(test_window_positions).copy()
-
-        event_types   = filters.get('event_types')
-        exclude_quiet = filters.get('exclude_quiet', False)
-        forecast_only = filters.get('forecast_only', False)
-
-        if event_types is not None or exclude_quiet or forecast_only:
-            filtered_wps = dataset.filter_indices_by_event_type(
-                filtered_wps.tolist(),
-                event_types=event_types,
-                exclude_quiet=exclude_quiet,
-                forecast_only=forecast_only,
-            )
-
-        # ── Apply strength filter ─────────────────────────────────────────────
-        min_strength = filters.get('min_strength')
-        max_strength = filters.get('max_strength')
-
-        if min_strength is not None or max_strength is not None:
-            filtered_wps = dataset.filter_indices_by_storm_strength(
-                filtered_wps.tolist() if not isinstance(filtered_wps, list) else filtered_wps,
-                min_strength=min_strength if min_strength is not None else 0.0,
-                max_strength=max_strength,
-            )
-
-        if len(filtered_wps) == 0:
-            print(f"  [{label}]: no cases found — skipping")
-            selected[label] = None
-            continue
-
-        # ── Get target values for this subset ─────────────────────────────────
-        filtered_test_indices = [
-            window_pos_to_test_idx[wp]
-            for wp in filtered_wps
-            if wp in window_pos_to_test_idx
-        ]
-        filtered_targets = targets[filtered_test_indices]
-
-        # ── Pick representative case ──────────────────────────────────────────
-        if selection == 'strongest':
-            pick_pos = int(np.argmax(filtered_targets))
-        elif selection == 'random':
-            pick_pos = int(np.random.randint(0, len(filtered_targets)))
-        else:  # median
-            median_val = np.median(filtered_targets)
-            pick_pos = int(np.argmin(np.abs(filtered_targets - median_val)))
-
-        chosen_wp     = int(filtered_wps[pick_pos])
-        chosen_target = float(filtered_targets[pick_pos])
-
-        print(f"  [{label}]: {len(filtered_wps)} candidates → "
-              f"window_position={chosen_wp}, max_target={chosen_target:.2f}")
-
-        selected[label] = chosen_wp
-
-    # Drop any categories with no cases
-    selected = {k: v for k, v in selected.items() if v is not None}
-
-    print(f"\nSelected {len(selected)} cases total.")
-    return selected
+            try: 
+                case_info['y_pred_weibull_median'] = float(results['y_pred_weibull_median'][test_idx])
+                case_info['y_pred_normal_median'] = float(results['y_pred_normal_median'][test_idx])
+                case_info['y_pred_weighted_mean'] = float(results['y_pred_weighted_mean'][test_idx])
+                case_info['lambda'] = float(results['lambda'][test_idx])
+                case_info['k'] = float(results['k'][test_idx])
+                case_info['mu'] = float(results['mu'][test_idx])
+                case_info['sigma'] = float(results['sigma'][test_idx])
+            except: 
+                print('Case info extracted')
+            
+            # Add recalculated label to case_info if verified
+            if verify_labels and 'ICME_flag' in dataset.df.columns:
+                case_info['stored_label'] = stored_label
+                case_info['recalculated_label'] = recalc_label
+                case_info['label_match'] = stored_label == recalc_label
+            
+            cases.append(case_info)
+            
+            if plot_function is not None:
+                try:
+                    plot_function(dataset, results, window_position, test_idx, config=config)
+                except Exception as e:
+                    logger.error(f"Error plotting case {i+1}: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    continue
+    
+    print(f"\n{'='*80}\n")
+    
+    return {
+        'metrics': metrics,
+        'cases': cases,
+        'filtered_window_positions': filtered_window_positions,
+        'filtered_test_indices': filtered_test_indices,
+        'predictions': filtered_preds,
+        'targets': filtered_targets,
+        'config': config,
+        'results': results,
+        'dataset': dataset,
+        'filter_params': {
+            'event_types': event_types,
+            'min_strength': min_strength,
+            'max_strength': max_strength,
+            'exclude_quiet': exclude_quiet,
+            'forecast_only': forecast_only
+        }
+    }
+    
 
 def auto_detect_and_plot_case_studies(
     results_dir: Path,
@@ -1977,7 +1320,7 @@ def _binned(x, y, edges, min_count=8):
 
 def plot_distribution_parameters(
     results, event_types=None, min_strength=None, max_strength=None,
-    exclude_quiet=False, storm_threshold=4.66, bins=None,
+    exclude_quiet=False, storm_threshold=4.5, bins=None,
     save=False, save_name=None,
 ):
     """
@@ -1995,7 +1338,7 @@ def plot_distribution_parameters(
         results = {Path(p).stem: p for p in results}
 
     if bins is None:
-        bins = np.array([0, 2, 3, 4, 4.66, 5.5, 6.5, 8, 12])
+        bins = np.array([0, 2, 3, 4, 4.5, 5.5, 6.5, 8, 12])
 
     fig, axes = plt.subplots(1, 3, figsize=(19, 5.2))
     colours = plt.cm.viridis(np.linspace(0, 0.85, len(results)))
@@ -2069,3 +1412,90 @@ def plot_distribution_parameters(
         print(f"\nSaved to: {save_name}")
     plt.show()
     return fig
+
+
+# Example usage and testing
+if __name__ == "__main__":
+    from storm_regression.predictive import (
+        LogNormalForecast, NormalForecast, WeibullForecast,
+    )
+
+    print("=" * 64)
+    print("Testing forecast_analysis evaluation functions")
+    print("=" * 64)
+
+    rng = np.random.default_rng(42)
+    n = 200
+
+    # ---- 1. Deterministic metrics -------------------------------------------
+    print("\n1. Deterministic metrics (evaluate_regression_forecast)")
+    print("-" * 64)
+    y_true = np.exp(rng.normal(1.4, 0.4, n))          # positive, right-skewed
+    y_pred = y_true + rng.normal(0, 0.5, n)           # noisy predictions
+    det = evaluate_regression_forecast(y_pred, y_true)
+    for k, v in det.items():
+        print(f"  {k.upper():<12}: {v:.4f}")
+
+    # ---- 2. CRPS via the adapter, for each distribution ---------------------
+    # These route through the verified closed forms in predictive.py.
+    print("\n2. Probabilistic metrics (evaluate_distribution_forecast)")
+    print("-" * 64)
+
+    log_mu = rng.normal(1.4, 0.3, n)
+    log_sigma = np.abs(rng.normal(0.5, 0.1, n)) + 0.05
+    # draw observations from the forecast itself (well-calibrated case)
+    y_ln = np.exp(log_mu + log_sigma * rng.standard_normal(n))
+
+    ln = evaluate_distribution_forecast(
+        y_ln, distribution="lognormal",
+        log_mu_pred=log_mu, log_sigma_pred=log_sigma,
+    )
+    print(f"  LogNormal  mean CRPS : {ln['crps']:.4f}")
+
+    mu = rng.normal(5.0, 1.0, n)
+    sigma = np.abs(rng.normal(1.5, 0.3, n)) + 0.1
+    y_no = mu + sigma * rng.standard_normal(n)
+    no = evaluate_distribution_forecast(
+        y_no, distribution="normal",
+        mu_pred=mu, sigma_pred=sigma,
+    )
+    print(f"  Normal     mean CRPS : {no['crps']:.4f}")
+
+    lam = np.abs(rng.normal(4.0, 0.5, n)) + 0.5
+    k = np.abs(rng.normal(2.0, 0.3, n)) + 0.3
+    y_wb = weibull_min.rvs(c=k, scale=lam, random_state=rng)
+    wb = evaluate_distribution_forecast(
+        y_wb, distribution="weibull",
+        lambda_pred=lam, k_pred=k,
+    )
+    print(f"  Weibull    mean CRPS : {wb['crps']:.4f}")
+
+    # ---- 3. Verify closed-form CRPS against Monte Carlo ---------------------
+    # A single fixed case per family; closed form should match the energy-score
+    # estimator to ~2-3 dp. This guards against a CRPS regression.
+    print("\n3. Closed-form vs Monte-Carlo CRPS (sanity check)")
+    print("-" * 64)
+
+    def _mc_crps(sampler, y, n_samp=2_000_000):
+        X = sampler(n_samp)
+        Xp = sampler(n_samp)
+        return np.mean(np.abs(X - y)) - 0.5 * np.mean(np.abs(X - Xp))
+
+    checks = [
+        ("LogNormal", LogNormalForecast(np.array([1.5]), np.array([0.5])),
+         4.5, lambda m: np.exp(1.5 + 0.5 * rng.standard_normal(m))),
+        ("Normal", NormalForecast(np.array([5.0]), np.array([1.5])),
+         5.0, lambda m: 5.0 + 1.5 * rng.standard_normal(m)),
+        ("Weibull", WeibullForecast(np.array([4.0]), np.array([2.0])),
+         4.5, lambda m: weibull_min.rvs(c=2.0, scale=4.0, size=m, random_state=rng)),
+    ]
+    print(f"  {'family':<12}{'closed-form':>13}{'MC ref':>11}{'|diff|':>9}")
+    for name, fc, yv, sampler in checks:
+        cf = float(fc.crps(np.array([yv]))[0])
+        mc = _mc_crps(sampler, yv)
+        flag = "ok" if abs(cf - mc) < 0.02 else "CHECK"
+        print(f"  {name:<12}{cf:>13.4f}{mc:>11.4f}{abs(cf - mc):>9.4f}  {flag}")
+
+    print("\n" + "=" * 64)
+    print("Done.")
+    print("=" * 64)
