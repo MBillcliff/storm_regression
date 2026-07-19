@@ -84,6 +84,9 @@ class TwCRPSLossConfig(LossConfig):
 class MixtureNLLLossConfig(LossConfig):
     loss_type: str = 'mixture_nll'
     n_components: int = 2
+    intensity_type: str = 'none'
+    intensity_strength: float = 1.0
+    storm_threshold: float = 4.5
 
 
 def get_loss_function(loss_config: LossConfig):
@@ -137,8 +140,8 @@ def get_loss_function(loss_config: LossConfig):
         return twcrps_loss
 
     elif loss_config.loss_type == 'mixture_nll':
-        def mix_nll(mu, sigma, weights, y_true):
-            return mixture_nll_loss(mu, sigma, weights, y_true)
+        def mix_nll(mu, sigma, weights, y_true, sample_weights):
+            return mixture_nll_loss(mu, sigma, weights, y_true, sample_weights)
         return mix_nll
             
     else:
@@ -750,13 +753,38 @@ def lognormal_logpdf(y, mu, sigma):
     return -logy - torch.log(sigma) - 0.5 * log_2pi - 0.5 * ((logy - mu) / sigma) ** 2
 
 
-def mixture_nll_loss(mu, sigma, weights, y_true):
-    """NLL of a K-component LogNormal mixture. mu/sigma/weights:(B,K), y_true:(B,)."""
+def mixture_nll_loss(mu, sigma, weights, y_true, sample_weights=None):
+    """NLL of a K-component LogNormal mixture, optionally sample-weighted.
+    mu/sigma/weights:(B,K), y_true:(B,), sample_weights:(B,) or None."""
     y = y_true.unsqueeze(1)
     log_comp = lognormal_logpdf(y, mu, sigma)
     log_weighted = torch.log(weights + 1e-12) + log_comp
-    log_p = torch.logsumexp(log_weighted, dim=1)
-    return -torch.mean(log_p)
+    log_p = torch.logsumexp(log_weighted, dim=1)          # (B,) per-window log-likelihood
+
+    if sample_weights is None:
+        return -torch.mean(log_p)
+    # weighted mean: normalise by sum of weights so the scale is comparable across configs
+    sample_weights = sample_weights.to(log_p.dtype)
+    return -torch.sum(sample_weights * log_p) / (torch.sum(sample_weights) + 1e-12)
+
+
+def intensity_weights(y_true, mode='none', strength=1.0, threshold=4.5):
+    """Per-sample weights emphasising high-intensity (storm) windows."""
+    if mode == 'none':
+        return torch.ones_like(y_true)
+    elif mode == 'step':
+        # storms get weight `strength`, non-storms get 1
+        return torch.where(y_true >= threshold,
+                           torch.full_like(y_true, strength),
+                           torch.ones_like(y_true))
+    elif mode == 'linear':
+        # weight grows linearly with target above a floor
+        return 1.0 + strength * torch.clamp(y_true - threshold, min=0.0)
+    elif mode == 'exponential':
+        # weight grows with intensity (careful — can explode)
+        return torch.exp(strength * torch.clamp(y_true - threshold, min=0.0))
+    else:
+        raise ValueError(f"unknown intensity mode: {mode}")
 
 
 def crps_lognormal_loss(
@@ -1084,10 +1112,17 @@ def train_mlp(
     loss_fn = get_loss_function(loss_config)
     logger.info(f"Loss function: {loss_config.loss_type} — config: {vars(loss_config)}")
 
+    intensity_type = getattr(loss_config, 'intensity_type', 'none')
+    intensity_strength = getattr(loss_config, 'intensity_strength', 1.0)
+    storm_threshold = getattr(loss_config, 'storm_threshold', 4.5)
+
     def compute_loss(out, y):
+        sw = intensity_weights(y, mode=intensity_type,
+                               strength=intensity_strength,
+                               threshold=storm_threshold)
         if is_mixture:
             mu, sigma, weights = out
-            return loss_fn(mu, sigma, weights, y)
+            return loss_fn(mu, sigma, weights, y, sample_weights=sw)
         log_mu, log_sigma = out
         return loss_fn(log_mu, log_sigma, y)
 
