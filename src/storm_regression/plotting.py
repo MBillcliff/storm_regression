@@ -2186,6 +2186,269 @@ def plot_loss_curve(results_path, save=False, save_name=None, huxt_id=None):
 
 
 # ============================================================================
+# Mixture Distribution Diagnostics
+# ============================================================================
+# Two entry points:
+#   plot_mixture_single(results_file)  -> detailed view of ONE run
+#       (weights, component separation, example PDFs, sigmas, param scatter matrix)
+#   plot_mixture_directory(results_dir) -> pooled distributions + disparities
+#       across MANY runs (parameter distributions split storm vs quiet)
+#
+# Append to plotting.py. Uses the existing load_results and save_figure.
+
+
+def _mixture_arrays(results):
+    """
+    Pull (mu, sigma, alpha, y, K) from a results dict; None if not a mixture.
+
+    Components are returned in their NATURAL (learned) order — NOT sorted. The
+    network appears to learn a stable role per component (each output head
+    specialising to a mode), so the raw per-component histograms are meaningful
+    as-is. (Smeared/overlapping per-component histograms would instead indicate
+    label switching — so the unsorted view doubles as a specialisation check.)
+    """
+    if 'mu_m' not in results:
+        return None
+    mu = np.asarray(results['mu_m'])
+    sigma = np.asarray(results['sigma_m'])
+    alpha = np.asarray(results['alpha'])
+    y = np.asarray(results['y_test']).ravel()
+    return mu, sigma, alpha, y, mu.shape[1]
+
+
+def plot_mixture_single(
+    results_file,
+    storm_threshold: float = 4.5,
+    huxt_id: Optional[int] = None,
+    save_name: Optional[str] = None,
+):
+    """
+    Mixture diagnostics for a SINGLE results file.
+
+    Components are shown in their natural (learned) order — not sorted — so the
+    per-component histograms reflect whatever roles the network has learned.
+
+    Figure 1 (2x2 summary), all storm (red) vs quiet (blue):
+        - per-component alpha (weights) histograms
+        - per-component mu histograms
+        - per-component sigma histograms
+        - component 0 vs 1 median scatter (points on identity line = collapsed)
+    Figure 2 (disparity): how multimodal forecasts get —
+        - mu disparity  (max-min mu across components; large = well-separated modes)
+        - alpha balance  (min alpha; large = both components genuinely used)
+    Figure 3 (K panels of 3x3): per-component scatter of that component's own
+        mu / sigma / alpha against each other.
+
+    Parameters
+    ----------
+    results_file : str or Path
+    """
+    from storm_regression.results_io import load_results
+    from matplotlib.gridspec import GridSpec
+
+    results, config, _ = load_results(results_file)
+    parsed = _mixture_arrays(results)
+    if parsed is None:
+        logger.warning("%s has no mixture params (mu_m); nothing to plot.", results_file)
+        return
+    mu, sigma, alpha, y, K = parsed
+    is_storm = y > storm_threshold
+    logger.info("Single-file mixture: %d forecasts, K=%d, lead=%sh, %d storms",
+                len(y), K, config.get('lead_time'), int(is_storm.sum()))
+
+    def _dual_hist(ax, data, title, xlabel):
+        ax.hist(data[~is_storm], bins=40, alpha=0.5, color='steelblue', density=True, label='quiet')
+        ax.hist(data[is_storm], bins=40, alpha=0.6, color='crimson', density=True, label='storm')
+        ax.set_title(title, fontsize=10); ax.set_xlabel(xlabel, fontsize=9)
+        ax.set_yticks([]); ax.legend(fontsize=8)
+
+    # ---- Figure 1: 2x2 summary ----
+    fig, axes = plt.subplots(2, 2, figsize=(13, 9))
+
+    # (a) alpha per component (overlay components; storm/quiet by colour intensity)
+    ax = axes[0, 0]
+    for k in range(K):
+        ax.hist(alpha[:, k], bins=40, alpha=0.55, label=f'comp {k}', density=True)
+    ax.set_title('Mixture weights (alpha) per component'); ax.set_xlabel('weight')
+    ax.set_yticks([]); ax.legend(fontsize=8)
+
+    # (b) mu per component — shown in REAL Hp30 space (component median = exp(mu))
+    ax = axes[0, 1]
+    comp_median = np.exp(mu)
+    for k in range(K):
+        ax.hist(comp_median[:, k], bins=40, alpha=0.55, label=f'comp {k}', density=True)
+    ax.set_title('Component median (Hp30max) per component'); ax.set_xlabel('component median')
+    ax.set_yticks([]); ax.legend(fontsize=8)
+
+    # (c) sigma per component
+    ax = axes[1, 0]
+    for k in range(K):
+        ax.hist(sigma[:, k], bins=40, alpha=0.55, label=f'comp {k}', density=True)
+    ax.set_title('Component sigma per component'); ax.set_xlabel('sigma')
+    ax.set_yticks([]); ax.legend(fontsize=8)
+
+    # (d) component-0 vs component-1 median (collapse view), storm/quiet coloured
+    ax = axes[1, 1]
+    comp_med = np.exp(mu)
+    ax.scatter(comp_med[~is_storm, 0], comp_med[~is_storm, 1],
+               s=6, alpha=0.3, color='steelblue', label='quiet')
+    ax.scatter(comp_med[is_storm, 0], comp_med[is_storm, 1],
+               s=6, alpha=0.5, color='crimson', label='storm')
+    lim = [0, float(np.percentile(comp_med, 99))]
+    ax.plot(lim, lim, 'k--', lw=1, label='identical (collapse)')
+    ax.set_xlabel('component 0 median (low mode)')
+    ax.set_ylabel('component 1 median')
+    ax.set_title('Component 0 vs 1 median (on line = collapsed)'); ax.legend(fontsize=8)
+
+    plt.tight_layout()
+    if save_name:
+        save_figure(f'{save_name}_summary', subfolder='distribution_analysis', huxt_id=huxt_id)
+
+    # ---- Figure 2: multimodality disparity ----
+    comp_median = np.exp(mu)                     # real Hp30 space
+    mu_disp = comp_median.max(1) - comp_median.min(1)   # separation of extreme modes (Hp30)
+    alpha_bal = alpha.min(1)            # min weight: large => all comps genuinely used
+    fig2, ax2 = plt.subplots(1, 2, figsize=(12, 4.5))
+    _dual_hist(ax2[0], mu_disp,
+               'median disparity = max-min component median (large = distinct modes)',
+               'median disparity (Hp30max)')
+    _dual_hist(ax2[1], alpha_bal,
+               'min alpha (large = both/all components used, not collapsed)', 'min weight')
+    fig2.suptitle('How multimodal do individual forecasts get? (red=storm blue=quiet)',
+                  fontsize=12)
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    if save_name:
+        save_figure(f'{save_name}_disparity', subfolder='distribution_analysis', huxt_id=huxt_id)
+
+    logger.info("median disparity (Hp30)  storm mean=%.3f  quiet mean=%.3f "
+                "(storm larger => more multimodal in storms)",
+                mu_disp[is_storm].mean(), mu_disp[~is_storm].mean())
+    logger.info("min alpha     storm mean=%.3f  quiet mean=%.3f",
+                alpha_bal[is_storm].mean(), alpha_bal[~is_storm].mean())
+
+    # ---- Figure 3: per-component 3x3 (mu/sigma/alpha within each component) ----
+    fig3 = plt.figure(figsize=(4.0 * K + 1, 4.2))
+    outer = GridSpec(1, K, figure=fig3, wspace=0.25)
+    labels = ['mu', 'sigma', 'alpha']
+    for k in range(K):
+        P = np.column_stack([mu[:, k], sigma[:, k], alpha[:, k]])   # (N, 3)
+        sub = outer[0, k].subgridspec(3, 3, hspace=0.06, wspace=0.06)
+        for i in range(3):
+            for j in range(3):
+                ax = fig3.add_subplot(sub[i, j])
+                if j > i:
+                    # upper triangle is a mirror of the lower triangle — blank it
+                    ax.axis('off')
+                    continue
+                if i == j:
+                    ax.hist(P[~is_storm, i], bins=30, alpha=0.5, color='steelblue')
+                    ax.hist(P[is_storm, i], bins=30, alpha=0.6, color='crimson')
+                    ax.set_yticks([])
+                else:
+                    ax.scatter(P[~is_storm, j], P[~is_storm, i], s=2, alpha=0.2, color='steelblue')
+                    ax.scatter(P[is_storm, j], P[is_storm, i], s=2, alpha=0.4, color='crimson')
+                ax.set_xlabel(labels[j], fontsize=7) if i == 2 else ax.set_xticklabels([])
+                ax.set_ylabel(labels[i], fontsize=7) if j == 0 else ax.set_yticklabels([])
+                ax.tick_params(labelsize=5)
+        fig3.text((k + 0.5) / K, 1.0, f'component {k}', ha='center', fontsize=11)
+    fig3.suptitle(f'Per-component parameter relations (K={K}, red=storm blue=quiet)',
+                  fontsize=12, y=1.08)
+    if save_name:
+        save_figure(f'{save_name}_percomponent', subfolder='distribution_analysis', huxt_id=huxt_id)
+    plt.show()
+
+
+def plot_mixture_directory(
+    results_dir,
+    storm_threshold: float = 4.5,
+    max_points: int = 40000,
+    huxt_id: Optional[int] = None,
+    save_name: Optional[str] = None,
+):
+    """
+    Pooled mixture-parameter distributions across MANY results files.
+
+    Shows the full DISTRIBUTION of each parameter and of the between-component
+    disparities (max-min across components within a forecast), split storm vs
+    quiet — rather than a single collapse/no-collapse number. Prints the
+    disparity summary (mean/median/max/95th, storm vs quiet).
+
+    Only files sharing the first file's K are pooled (others skipped).
+
+    Parameters
+    ----------
+    results_files : iterable of (str or Path)
+        Paths to the results pickles to pool.
+    """
+    from storm_regression.results_io import load_results
+ 
+    results_files = sorted(Path(results_dir).glob('*.pkl'))
+    if not results_files:
+        logger.warning("No .pkl files in %s; nothing to plot.", results_dir)
+        return
+
+    MU, SG, AL, Y, K0 = [], [], [], [], None
+    for path in results_files:
+        results, _, _ = load_results(path)
+        parsed = _mixture_arrays(results)
+        if parsed is None:
+            continue
+        mu, sigma, alpha, y, K = parsed
+        if K0 is None:
+            K0 = K
+        if K != K0:
+            logger.warning("Skipping %s: K=%d != %d", path, K, K0)
+            continue
+        MU.append(mu); SG.append(sigma); AL.append(alpha); Y.append(y)
+    if not MU:
+        logger.warning("No mixture results with mu_m found; nothing to plot.")
+        return
+
+    mu = np.concatenate(MU); sigma = np.concatenate(SG)
+    alpha = np.concatenate(AL); y = np.concatenate(Y); K = K0
+    is_storm = y > storm_threshold
+
+    if mu.shape[0] > max_points:
+        idx = np.random.default_rng(0).choice(mu.shape[0], max_points, replace=False)
+        mu, sigma, alpha, is_storm = mu[idx], sigma[idx], alpha[idx], is_storm[idx]
+
+    # between-component disparities
+    disparities = {
+        'mu':             mu.max(1) - mu.min(1),
+        'median (native)': np.exp(mu).max(1) - np.exp(mu).min(1),
+        'sigma':          sigma.max(1) - sigma.min(1),
+        'alpha':          alpha.max(1) - alpha.min(1),
+    }
+
+    def _dual_hist(ax, data, title, xlabel):
+        ax.hist(data[~is_storm], bins=60, alpha=0.5, color='steelblue', density=True, label='quiet')
+        ax.hist(data[is_storm], bins=60, alpha=0.6, color='crimson', density=True, label='storm')
+        ax.set_title(title, fontsize=10); ax.set_xlabel(xlabel, fontsize=9)
+        ax.set_yticks([]); ax.legend(fontsize=8)
+
+    fig, axes = plt.subplots(3, K + 1, figsize=(3.2 * (K + 1), 9))
+    for k in range(K):
+        _dual_hist(axes[0, k], mu[:, k],    f'mu_{k}', 'mu')
+        _dual_hist(axes[1, k], sigma[:, k], f'sigma_{k}', 'sigma')
+        _dual_hist(axes[2, k], alpha[:, k], f'alpha_{k}', 'weight')
+    _dual_hist(axes[0, K], disparities['mu'],    'mu disparity',    'range')
+    _dual_hist(axes[1, K], disparities['sigma'], 'sigma disparity', 'range')
+    _dual_hist(axes[2, K], disparities['alpha'], 'alpha disparity', 'range')
+    fig.suptitle(f'Mixture parameter distributions (K={K}, pooled; red=storm blue=quiet)',
+                 fontsize=13)
+    plt.tight_layout(rect=[0, 0, 1, 0.97])
+    if save_name:
+        save_figure(save_name, subfolder='distribution_analysis', huxt_id=huxt_id)
+    plt.show()
+
+    logger.info("Between-component disparities (K=%d, pooled over %d files):", K, len(MU))
+    for name, d in disparities.items():
+        logger.info("  %-16s mean=%.3f median=%.3f max=%.3f 95th=%.3f | storm=%.3f quiet=%.3f",
+                    name, d.mean(), np.median(d), d.max(), np.percentile(d, 95),
+                    d[is_storm].mean(), d[~is_storm].mean())
+    
+
+# ============================================================================
 # Example Usage
 # ============================================================================
 
