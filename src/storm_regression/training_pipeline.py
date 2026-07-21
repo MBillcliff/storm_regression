@@ -140,7 +140,7 @@ def get_loss_function(loss_config: LossConfig):
         return twcrps_loss
 
     elif loss_config.loss_type == 'mixture_nll':
-        def mix_nll(mu, sigma, weights, y_true, sample_weights):
+        def mix_nll(mu, sigma, weights, y_true, sample_weights=None):
             return mixture_nll_loss(mu, sigma, weights, y_true, sample_weights)
         return mix_nll
             
@@ -183,6 +183,14 @@ class TrainingConfig:
     mlp_learning_rate: float = 0.001
     mlp_patience: int = 10
     mlp_device: str = 'cpu'
+
+    # set-encoder settings
+    se_phi_hidden: tuple = (64, 64)
+    se_rho_hidden: tuple = (64, 64)
+    se_pool: str = 'mean'          # 'mean' | 'max' | 'meanmax'
+    se_attention: bool = False     # learned per-member weighting (§5.3)
+    se_init_spread: bool = False   # hot-start: spread component medians at init
+    se_init_spread_range: tuple = (1.0, 7.0)   # Hp30 range for the spread
 
     #loss function parameters
     loss_config: LossConfig = field(default_factory=NLLLossConfig)
@@ -660,6 +668,98 @@ class LogNormalMLP(nn.Module):
         
         return log_mu, log_sigma
 
+class SetEncoderMixture(nn.Module):
+    """
+    Deep Sets: shared per-member encoder phi -> permutation-invariant pool ->
+    concat shared context -> decoder rho -> K-component LogNormal mixture params.
+ 
+    pool='mean' (start here), 'max', or 'meanmax'. attention=False initially;
+    when True, pooling is a learned attention-weighted sum over members
+    (the 'learned per-member weighting' generalising Paper 1's 1/MAE^2).
+    """
+    def __init__(self, T, n_context, n_components=2,
+                 phi_hidden=(64, 64), rho_hidden=(64, 64),
+                 pool='mean', attention=False,
+                 init_spread=False, init_spread_range=(1.0, 7.0)):
+        super().__init__()
+        self.n_components = n_components
+        self.pool = pool
+        self.attention = attention
+ 
+        # phi: per-member encoder, T -> h  (shared across members)
+        phi_layers, d = [], T
+        for h in phi_hidden:
+            phi_layers += [nn.Linear(d, h), nn.ReLU()]
+            d = h
+        self.phi = nn.Sequential(*phi_layers)
+        self.h = d
+ 
+        # optional attention scorer: per-member embedding -> scalar weight
+        if attention:
+            self.attn = nn.Sequential(nn.Linear(self.h, self.h // 2), nn.Tanh(),
+                                      nn.Linear(self.h // 2, 1))
+ 
+        # rho: pooled(+context) -> mixture params
+        pooled_dim = self.h * (2 if pool == 'meanmax' else 1)
+        rho_layers, d = [], pooled_dim + n_context
+        for h in rho_hidden:
+            rho_layers += [nn.Linear(d, h), nn.ReLU()]
+            d = h
+        self.rho = nn.Sequential(*rho_layers)
+ 
+        # mixture head: 3K outputs (mu, log-sigma pre-softplus, weight logits)
+        self.head = nn.Linear(d, 3 * n_components)
+ 
+        # OPTIONAL spread initialisation of the mu biases.
+        # Default (init_spread=False): standard init -> all components start near
+        # the same place (mu biases ~0), so any learned structure is unbiased but
+        # a high-median component rarely arises on its own.
+        # init_spread=True: spread the K component *medians* evenly across
+        # init_spread_range (in Hp30 space) at start, so one component begins in
+        # the high tail. Symmetry is broken ONLY in location (mu); sigma and
+        # weights are left symmetric, so any weight/spread structure that emerges
+        # is genuinely learned, not imposed. If the data does not support a high
+        # component, training will pull it back down / bleed its weight — which is
+        # itself the diagnostic (init suppression vs data suppression).
+        if init_spread:
+            with torch.no_grad():
+                K = n_components
+                lo, hi = init_spread_range
+                targets = torch.linspace(lo, hi, K)        # medians in Hp30 space
+                self.head.bias[:K] = torch.log(targets)    # mu biases (log-space)
+                self.head.bias[K:2*K] = -0.5               # equal modest sigma start
+                self.head.bias[2*K:] = 0.0                 # equal weights start
+                # zero the mu-output WEIGHTS so the bias dominates at init
+                # (otherwise random weight*input can swamp the intended spread)
+                self.head.weight[:K, :] *= 0.01
+ 
+    def forward(self, v_members, context):
+        # v_members: (B, Nens, T), context: (B, n_context)
+        B, Nens, T = v_members.shape
+        e = self.phi(v_members.reshape(B * Nens, T)).reshape(B, Nens, self.h)  # (B,Nens,h)
+ 
+        if self.attention:
+            w = self.attn(e).squeeze(-1)              # (B, Nens)
+            w = torch.softmax(w, dim=1).unsqueeze(-1) # (B, Nens, 1)
+            pooled = (w * e).sum(dim=1)               # (B, h) attention-weighted
+        elif self.pool == 'mean':
+            pooled = e.mean(dim=1)
+        elif self.pool == 'max':
+            pooled = e.max(dim=1).values
+        elif self.pool == 'meanmax':
+            pooled = torch.cat([e.mean(dim=1), e.max(dim=1).values], dim=1)
+        else:
+            raise ValueError(self.pool)
+ 
+        z = self.rho(torch.cat([pooled, context], dim=1))
+        raw = self.head(z)                            # (B, 3K)
+        K = self.n_components
+        mu     = raw[:, :K]
+        sigma  = torch.nn.functional.softplus(raw[:, K:2*K]) + 1e-3
+        logits = raw[:, 2*K:]
+        weights = torch.softmax(logits, dim=1)
+        return mu, sigma, weights
+
 
 def negative_log_likelihood_lognormal(
     log_mu_pred, 
@@ -1019,6 +1119,60 @@ def prepare_mlp_features(
     return features_scaled, scaler
 
 
+def prepare_set_encoder_features(
+    batch,
+    n_ensembles: int = 200,
+    scaler=None,               # scales the shared (OMNI+hist) context only
+    fit_scaler: bool = False,
+    v_scaler=None,             # scales per-member velocity (fit on flattened v)
+    fit_v_scaler: bool = False,
+):
+    """
+    Prepare features for the set encoder.
+ 
+    Returns:
+        v_members : (B, Nens, T)  per-member velocity series (member axis preserved)
+        context   : (B, n_context) shared non-member features (OMNI + historic Hp30)
+        scaler, v_scaler
+    v is (B, T, Nens) in the batch -> transpose to (B, Nens, T) so each member
+    is a T-length sequence for the shared encoder phi.
+    """
+    v = batch['v'].numpy()                 # (B, T, Nens)
+    omni = batch['omni'].numpy()           # (B, T_in, N_omni)
+    hist = batch['historic_target'].numpy()  # (B, hist_len)
+ 
+    B, T, Nens = v.shape
+ 
+    # --- per-member velocity: (B, T, Nens) -> (B, Nens, T) ---
+    v_members = np.transpose(v, (0, 2, 1)).astype(np.float32)   # (B, Nens, T)
+ 
+    # scale velocity (fit on ALL members' values pooled, so members share a scale)
+    if fit_v_scaler:
+        from sklearn.preprocessing import MinMaxScaler
+        v_scaler = MinMaxScaler()
+        v_scaler.fit(v_members.reshape(-1, T))          # (B*Nens, T)
+    if v_scaler is None:
+        raise ValueError("v_scaler required")
+    v_members = v_scaler.transform(v_members.reshape(-1, T)).reshape(B, Nens, T).astype(np.float32)
+ 
+    # --- shared context (OMNI + historic Hp30), NOT per-member ---
+    context_parts = []
+    if omni.shape[-1] > 0:
+        context_parts.append(omni.reshape(B, -1))
+    context_parts.append(hist.reshape(B, -1))
+    context = np.concatenate(context_parts, axis=1).astype(np.float32)
+ 
+    if fit_scaler:
+        from sklearn.preprocessing import MinMaxScaler
+        scaler = MinMaxScaler()
+        scaler.fit(context)
+    if scaler is None:
+        raise ValueError("context scaler required")
+    context = scaler.transform(context).astype(np.float32)
+ 
+    return v_members, context, scaler, v_scaler
+
+
 def train_mlp(
     train_dataloader: DataLoader,
     val_dataloader: DataLoader,          # NEW: explicit, rotation-aligned val set
@@ -1178,6 +1332,139 @@ def train_mlp(
     return model, scaler, history
 
 
+def train_set_encoder(
+    train_dataloader,
+    val_dataloader,
+    n_ensembles,
+    loss_config,
+    config,
+    device='cpu',
+    patience=20,
+    n_epochs=1000,
+    learning_rate=1e-4,
+    batch_size=64,
+    weight_decay=0.0,
+    debug=False):
+    
+    """Train MLP to predict (mixture) LogNormal parameters.
+
+    Early stopping watches a rotation-aligned VALIDATION set (passed in as
+    ``val_dataloader``), constructed by the same leakage-safe block split as the
+    test set — NOT a random slice of the training windows. Best-validation
+    weights are restored before returning. The TEST set is never touched here.
+    """
+    if not isinstance(batch_size, int) or batch_size <= 0:
+        if debug:
+            print(f"DEBUG: bad batch_size={batch_size!r}; defaulting to 256")
+        batch_size = 256
+
+    # fit scalers ONCE on the first train batch
+    first_batch = next(iter(train_dataloader))
+    _, _, ctx_scaler, v_scaler = prepare_set_encoder_features(
+        first_batch, n_ensembles, fit_scaler=True, fit_v_scaler=True)
+
+    def _cache(dataloader, name):
+        V, C, Y = [], [], []
+        for batch in dataloader:
+            v_m, ctx, _, _ = prepare_set_encoder_features(
+                batch, n_ensembles, scaler=ctx_scaler, v_scaler=v_scaler)
+            V.append(v_m); C.append(ctx); Y.append(batch['max_target'].numpy())
+        if not V:
+            raise RuntimeError(f"{name} dataloader empty")
+        v_t = torch.as_tensor(np.concatenate(V), dtype=torch.float32, device=device)
+        c_t = torch.as_tensor(np.concatenate(C), dtype=torch.float32, device=device)
+        y_t = torch.as_tensor(np.concatenate(Y), dtype=torch.float32, device=device)
+        return v_t, c_t, y_t
+
+    v_tr, c_tr, y_tr = _cache(train_dataloader, "train")
+    v_val, c_val, y_val = _cache(val_dataloader, "val")
+
+    n_tr = v_tr.shape[0]
+    n_val = v_val.shape[0]
+
+    logger.info(f"Cached train {n_tr}, val {n_val} (rotation-aligned val set)")
+
+    T = v_tr.shape[2]              # per-member series length (144 at your settings)
+    n_context = c_tr.shape[1]
+    model = SetEncoderMixture(
+        T=T, n_context=n_context, n_components=loss_config.n_components,
+        phi_hidden=config.se_phi_hidden, rho_hidden=config.se_rho_hidden,
+        pool=config.se_pool, attention=config.se_attention,
+        init_spread=config.se_init_spread,
+        init_spread_range=getattr(config, 'se_init_spread_range', (1.0, 7.0)),
+    ).to(device)
+
+    logger.info(f"Total trainable parameters: {sum(p.numel() for p in model.parameters()):,}")
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+
+    if loss_config is None:
+        loss_config = NLLLossConfig()
+    loss_fn = get_loss_function(loss_config)
+    logger.info(f"Loss function: {loss_config.loss_type} — config: {vars(loss_config)}")
+
+    intensity_type = getattr(loss_config, 'intensity_type', 'none')
+    intensity_strength = getattr(loss_config, 'intensity_strength', 1.0)
+    storm_threshold = getattr(loss_config, 'storm_threshold', 4.5)
+
+    def compute_loss(out, y):
+        mu, sigma, weights = out
+        sw = intensity_weights(y, mode=intensity_type,
+                               strength=intensity_strength,
+                               threshold=storm_threshold)
+        return loss_fn(mu, sigma, weights, y, sample_weights=sw)
+
+    best_val = float('inf')
+    best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+    best_epoch = 0
+    patience_counter = 0
+    train_history, val_history = [], []
+
+    for epoch in range(n_epochs):
+        model.train()
+        perm = torch.randperm(n_tr, device=device)
+        epoch_loss, n_batches = 0.0, 0
+        for start in range(0, n_tr, batch_size):
+            sel = perm[start:start + batch_size]
+            out = model(v_tr[sel], c_tr[sel])
+            loss = compute_loss(out, y_tr[sel])
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+            optimizer.step()
+            epoch_loss += loss.item()
+            n_batches += 1
+        avg_train = epoch_loss / max(n_batches, 1)
+
+        model.eval()
+        with torch.no_grad():
+            val_loss = compute_loss(model(v_val, c_val), y_val).item()
+
+        train_history.append(avg_train)
+        val_history.append(val_loss)
+
+        if (epoch + 1) % 10 == 0:
+            logger.info(f"Epoch {epoch+1}/{n_epochs}, train: {avg_train:.4f}, val: {val_loss:.4f}")
+
+        if val_loss < best_val:
+            best_val = val_loss
+            best_epoch = epoch + 1
+            best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                logger.info(f"Early stopping at epoch {epoch+1} "
+                            f"(best val {best_val:.4f} at epoch {best_epoch})")
+                break
+
+    history = {'train': train_history, 'val': val_history,
+               'best_epoch': best_epoch, 'best_val': best_val}
+    model.load_state_dict(best_state)
+    logger.info(f"Training complete. Best val loss: {best_val:.4f} (epoch {best_epoch}); "
+                f"restored best weights.")
+    return model, (ctx_scaler, v_scaler), history
+
+
 def evaluate_mlp_test_set(
     model,
     test_dataloader: DataLoader,
@@ -1295,6 +1582,91 @@ def evaluate_mlp_test_set(
 
     results['window_idx'] = results['center_idx']
     return results
+
+
+def evaluate_set_encoder_test_set(
+    model,
+    test_dataloader,
+    scalers,                    # (ctx_scaler, v_scaler) tuple from train_set_encoder
+    n_ensembles: int = 200,
+    device: str = 'cpu',
+):
+    """
+    Evaluate a trained set encoder on the test set.
+
+    Mirrors evaluate_mlp_test_set's MIXTURE path exactly (the set encoder is
+    always a mixture head), producing a byte-compatible results dict so that
+    forecast_from_results / fast_batch_metrics read it identically to K=2 MLP
+    results. The ONLY differences from evaluate_mlp_test_set are:
+      (1) feature prep via prepare_set_encoder_features (two scalers),
+      (2) two-argument forward model(v, ctx),
+      (3) no is_mixture branch (always mixture).
+    """
+    ctx_scaler, v_scaler = scalers          # unpack the TWO scalers
+    model.eval()
+    all_outputs = []
+
+    with torch.no_grad():
+        for batch in tqdm(test_dataloader, desc="Test batches (set encoder)"):
+            v_m, ctx, _, _ = prepare_set_encoder_features(
+                batch, n_ensembles,
+                scaler=ctx_scaler, v_scaler=v_scaler,
+                fit_scaler=False, fit_v_scaler=False,
+            )
+            v_torch = torch.as_tensor(v_m, dtype=torch.float32, device=device)
+            c_torch = torch.as_tensor(ctx, dtype=torch.float32, device=device)
+
+            mu, sigma, weights = model(v_torch, c_torch)   # two-arg forward
+
+            # ---- shared batch extras (identical to evaluate_mlp_test_set) ----
+            hist = batch['historic_target'].cpu().numpy().squeeze(axis=-1)
+            y_true = batch['max_target'].cpu().numpy()
+            recurrence = batch['27_day_target'].cpu().numpy().squeeze(axis=-1)
+            center_indices = batch['center_idx'].cpu().numpy()
+            if recurrence.ndim == 1:
+                recurrence = recurrence.reshape(-1, 1)
+            y_pred_persistence = hist[:, -1]
+            y_pred_persistence_max = np.max(hist, axis=-1)
+            y_pred_27_day = np.max(recurrence, axis=-1)
+
+            mu_np    = mu.cpu().numpy()        # (B, K)
+            sigma_np = sigma.cpu().numpy()     # (B, K)
+            w_np     = weights.cpu().numpy()   # (B, K)
+
+            # Mixture median via the predictive abstraction (weighted-CDF inversion).
+            from storm_regression.predictive import MixtureForecast, LogNormalForecast
+            K = mu_np.shape[1]
+            components = [LogNormalForecast(mu_np[:, k], sigma_np[:, k]) for k in range(K)]
+            fcst = MixtureForecast(components, w_np)
+            mixture_median = fcst.median()
+
+            # top-weight component as single-LogNormal fallback (keeps lognormal
+            # metrics block alive; same convention as evaluate_mlp_test_set)
+            top = np.argmax(w_np, axis=1)
+            rows = np.arange(mu_np.shape[0])
+            log_mu_np    = mu_np[rows, top]
+            log_sigma_np = sigma_np[rows, top]
+
+            all_outputs.append({
+                'y_test': y_true.ravel(),
+                'y_pred_lognormal_median': mixture_median,
+                'y_pred_persistence': y_pred_persistence,
+                'y_pred_persistence_max': y_pred_persistence_max,
+                'y_pred_27_day_recurrence': y_pred_27_day,
+                'mu_m': mu_np,
+                'sigma_m': sigma_np,
+                'alpha': w_np,
+                'log_mu': log_mu_np,
+                'log_sigma': log_sigma_np,
+                'center_idx': center_indices,
+            })
+
+    results = {}
+    for key in all_outputs[0]:
+        results[key] = np.concatenate([d[key] for d in all_outputs], axis=0)
+    results['window_idx'] = results['center_idx']
+    return results
+
     
 
 def compute_distribution_statistics(params: np.ndarray) -> Dict[str, float]:
@@ -1583,6 +1955,21 @@ def run_training_pipeline(config: TrainingConfig):
                         regressor_name = f"MLP_{'stats' if config.mlp_include_ensemble_spread else 'flat'}"
                         models_dict = {regressor_name: (mlp_model, scaler)}
                         
+                    elif config.model_type == 'set_encoder':
+                        logger.info("Using set encoder model")
+                        train_dataset = Subset(dataset, train_indices)
+                        val_dataset   = Subset(dataset, val_indices)
+                        train_dataloader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True)
+                        val_dataloader   = DataLoader(val_dataset,   batch_size=config.batch_size, shuffle=False)
+                
+                        se_model, se_scalers, loss_history = train_set_encoder(
+                            train_dataloader, val_dataloader, config.n_ensembles,
+                            loss_config=config.loss_config, config=config,
+                            device=config.mlp_device, patience=config.mlp_patience,
+                            n_epochs=config.mlp_n_epochs, learning_rate=config.mlp_learning_rate,
+                            batch_size=config.batch_size)
+                        regressor_name = f"SetEncoder_{config.se_pool}{'_attn' if config.se_attention else ''}"
+                        models_dict = {regressor_name: (se_model, se_scalers)}
                     else:  # ensemble regression
                         logger.info("Using ensemble regression")
                         
@@ -1647,6 +2034,15 @@ def run_training_pipeline(config: TrainingConfig):
                                 device=config.mlp_device,
                             )
                             results['loss_history'] = loss_history
+                        elif config.model_type == 'set_encoder':
+                            results = evaluate_set_encoder_test_set(
+                                model_or_models,
+                                test_dataloader,
+                                scaler,                    # (ctx_scaler, v_scaler) tuple
+                                config.n_ensembles,
+                                device=config.mlp_device,
+                            )
+                            results['loss_history'] = loss_history
                         else:
                             results = evaluate_test_set(
                                 model_or_models,
@@ -1683,8 +2079,8 @@ def run_training_pipeline(config: TrainingConfig):
                             'omni_subset': '-'.join(config.omni_subset),
                         }
                         
-                        # For MLP, only evaluate LogNormal median
-                        if config.model_type == 'mlp':
+                        # For MLP or set_encoder, only evaluate LogNormal median
+                        if config.model_type == 'mlp' or config.model_type == 'set_encoder':
                             aggregators = {
                                 'lognormal_median': results['y_pred_lognormal_median'],
                                 'persistence': results['y_pred_persistence'],
