@@ -1279,7 +1279,7 @@ def analyze_results(
     
 
 def auto_detect_and_plot_case_studies(
-    results_dir: Path,
+    results_input,
     seed: int = 42,
     fold: int = 0,
     threshold: float = 4.5,
@@ -1294,12 +1294,13 @@ def auto_detect_and_plot_case_studies(
     plot_function: Optional[Callable] = None,
     case_indices: Optional[List[int]] = None,
 ):
-    pattern      = "*.pkl"
-    result_files = sorted(results_dir.glob(pattern))
-
-    if not result_files:
-        print(f"No results files found in {results_dir}")
-        return {}
+    from pathlib import Path
+    # normalise: accept a directory OR a list/iterable of files
+    if isinstance(results_input, (str, Path)) and Path(results_input).is_dir():
+        result_files = sorted(Path(results_input).glob('*.pkl'))
+    else:
+        # assume it's already a list/iterable of file paths
+        result_files = [Path(f) for f in results_input]
 
     print(f"\n{'='*80}")
     print(f"Auto-detected {len(result_files)} results file(s):")
