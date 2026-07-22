@@ -191,6 +191,9 @@ class TrainingConfig:
     se_attention: bool = False     # learned per-member weighting (§5.3)
     se_init_spread: bool = False   # hot-start: spread component medians at init
     se_init_spread_range: tuple = (1.0, 7.0)   # Hp30 range for the spread
+    se_self_attention: bool = False
+    se_sa_heads: int = 4
+    se_sa_layers: int = 1
 
     #loss function parameters
     loss_config: LossConfig = field(default_factory=NLLLossConfig)
@@ -680,11 +683,13 @@ class SetEncoderMixture(nn.Module):
     def __init__(self, T, n_context, n_components=2,
                  phi_hidden=(64, 64), rho_hidden=(64, 64),
                  pool='mean', attention=False,
+                 self_attention=False, sa_heads=4, sa_layers=1,
                  init_spread=False, init_spread_range=(1.0, 7.0)):
         super().__init__()
         self.n_components = n_components
         self.pool = pool
         self.attention = attention
+        self.self_attention = self_attention
  
         # phi: per-member encoder, T -> h  (shared across members)
         phi_layers, d = [], T
@@ -694,7 +699,25 @@ class SetEncoderMixture(nn.Module):
         self.phi = nn.Sequential(*phi_layers)
         self.h = d
  
-        # optional attention scorer: per-member embedding -> scalar weight
+        # optional INTER-MEMBER self-attention: each member's embedding is updated
+        # by attending to ALL other members, so its representation depends on its
+        # relationship to the ensemble (e.g. "am I an outlier?"), not just its own
+        # features. Permutation-equivariant (MultiheadAttention with batch_first),
+        # so the subsequent pool stays permutation-invariant. Set Transformer-style
+        # (Lee et al. 2019). This is the key difference from `attention`, which
+        # scores each member in ISOLATION.
+        if self_attention:
+            self.sa_blocks = nn.ModuleList()
+            for _ in range(sa_layers):
+                self.sa_blocks.append(nn.ModuleDict({
+                    'mha': nn.MultiheadAttention(self.h, sa_heads, batch_first=True),
+                    'norm1': nn.LayerNorm(self.h),
+                    'ff': nn.Sequential(nn.Linear(self.h, self.h), nn.ReLU(),
+                                        nn.Linear(self.h, self.h)),
+                    'norm2': nn.LayerNorm(self.h),
+                }))
+ 
+        # optional attention-weighted POOL scorer: per-member embedding -> scalar
         if attention:
             self.attn = nn.Sequential(nn.Linear(self.h, self.h // 2), nn.Tanh(),
                                       nn.Linear(self.h // 2, 1))
@@ -737,6 +760,14 @@ class SetEncoderMixture(nn.Module):
         # v_members: (B, Nens, T), context: (B, n_context)
         B, Nens, T = v_members.shape
         e = self.phi(v_members.reshape(B * Nens, T)).reshape(B, Nens, self.h)  # (B,Nens,h)
+ 
+        # INTER-MEMBER self-attention: update each member by attending to all others.
+        # Permutation-equivariant, so pooling afterwards remains invariant.
+        if self.self_attention:
+            for blk in self.sa_blocks:
+                attn_out, _ = blk['mha'](e, e, e)          # self-attention (Q=K=V=e)
+                e = blk['norm1'](e + attn_out)             # residual + norm
+                e = blk['norm2'](e + blk['ff'](e))         # feed-forward + residual + norm
  
         if self.attention:
             w = self.attn(e).squeeze(-1)              # (B, Nens)
@@ -1390,6 +1421,9 @@ def train_set_encoder(
         T=T, n_context=n_context, n_components=loss_config.n_components,
         phi_hidden=config.se_phi_hidden, rho_hidden=config.se_rho_hidden,
         pool=config.se_pool, attention=config.se_attention,
+        self_attention=config.se_self_attention,      
+        sa_heads=config.se_sa_heads,                   
+        sa_layers=config.se_sa_layers,                 
         init_spread=config.se_init_spread,
         init_spread_range=getattr(config, 'se_init_spread_range', (1.0, 7.0)),
     ).to(device)
